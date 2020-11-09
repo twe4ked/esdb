@@ -25,6 +25,35 @@ pub struct Event {
     pub metadata: JsonValue,
 }
 
+impl Event {
+    fn from_new_event(
+        new_event: NewEvent,
+        aggregate_id: Uuid,
+        sequence: u64,
+        event_id: Uuid,
+    ) -> Self {
+        let NewEvent {
+            aggregate_sequence,
+            aggregate_type,
+            event_type,
+            body,
+            metadata,
+        } = new_event;
+
+        Event {
+            sequence,
+            aggregate_sequence: aggregate_sequence,
+            event_id,
+            aggregate_id: aggregate_id,
+            aggregate_type: aggregate_type,
+            event_type: event_type,
+            created_at: Utc::now(),
+            body: body,
+            metadata: metadata,
+        }
+    }
+}
+
 #[derive(Deserialize, Serialize, Debug, PartialEq, Clone)]
 struct EventId(Uuid);
 
@@ -118,17 +147,7 @@ impl EventStore {
             u64::from_be_bytes(array)
         };
 
-        let event = Event {
-            sequence,
-            aggregate_sequence: new_event.aggregate_sequence.clone(),
-            event_id,
-            aggregate_id: aggregate_id,
-            aggregate_type: new_event.aggregate_type.clone(),
-            event_type: new_event.event_type.clone(),
-            created_at: Utc::now(),
-            body: new_event.body.clone(),
-            metadata: new_event.metadata.clone(),
-        };
+        let event = Event::from_new_event(new_event, aggregate_id, sequence, event_id);
 
         // KEY: event_id
         events
