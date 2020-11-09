@@ -65,8 +65,6 @@ impl EventStore {
         let event_id = Uuid::new_v4();
 
         // KEY: aggregate_id + aggregate_sequence
-        //
-        // We need to ensure this key is unique otherwise we have a "stale aggregate".
         let aggregates_key: Vec<u8> = aggregate_id
             .as_bytes()
             .clone()
@@ -74,12 +72,16 @@ impl EventStore {
             .chain(new_event.aggregate_sequence.to_be_bytes().iter())
             .copied()
             .collect();
+        // The compare_and_swap here ensure the aggregate_id + aggregate_sequence is unique so we
+        // can be sure we don't have a stale aggregate.
         aggregates
-            .insert(
+            .compare_and_swap(
                 &to_key(aggregates_key),
-                serde_json::to_vec(&EventId(event_id)).unwrap(),
+                None as Option<&[u8]>,
+                Some(serde_json::to_vec(&EventId(event_id)).unwrap()),
             )
-            .unwrap();
+            .unwrap()
+            .expect("stale aggregate");
 
         fn increment(old: Option<&[u8]>) -> Option<Vec<u8>> {
             use std::convert::TryInto;
