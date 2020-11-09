@@ -148,16 +148,12 @@ impl EventStore {
         let event_ids = sequences.range(sequence.to_be_bytes()..(sequence + 1000).to_be_bytes());
 
         event_ids
-            .map(|event_id| {
+            .map(|event_id| -> EventId {
                 let (_k, event_id) = event_id.unwrap();
-                let e: EventId = serde_json::from_slice(&event_id).unwrap();
-                e
+                serde_json::from_slice(&event_id).unwrap()
             })
             .map(|event_id| events.get(event_id.0.as_bytes()).unwrap())
-            .map(|x| {
-                let e: Event = serde_json::from_slice(&x.unwrap()).unwrap();
-                e
-            })
+            .map(|e| -> Event { serde_json::from_slice(&e.unwrap()).unwrap() })
             .collect()
     }
 }
