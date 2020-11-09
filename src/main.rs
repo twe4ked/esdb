@@ -1,55 +1,43 @@
-use chrono::prelude::*;
 use serde_json::json;
 use sled::Config;
 use uuid::Uuid;
 
-use esdb::{Event, EventStore};
+use esdb::{EventStore, NewEvent};
 
 fn main() {
     let db = Config::default().temporary(true).open().unwrap();
     let event_store = EventStore::new_with_db(db);
 
-    let aggregate_id = Uuid::new_v4();
-
-    let event_1 = Event {
-        sequence: 1,
+    let event_1 = NewEvent {
         aggregate_sequence: 1,
-        event_id: Uuid::new_v4(),
-        aggregate_id,
         aggregate_type: "Foo".to_string(),
         event_type: "Fooed".to_string(),
         body: json!({ "an": "object" }),
         metadata: json!({ "an": "object" }),
-        created_at: Utc::now(),
     };
-    let event_2 = Event {
-        sequence: 2,
+    let event_2 = NewEvent {
         aggregate_sequence: 2,
-        event_id: Uuid::new_v4(),
-        aggregate_id,
         aggregate_type: "Foo".to_string(),
         event_type: "Fooed".to_string(),
         body: json!({ "an": "object" }),
         metadata: json!({ "an": "object" }),
-        created_at: Utc::now(),
     };
-    let event_3 = Event {
-        sequence: 3,
+    let event_3 = NewEvent {
         aggregate_sequence: 1,
-        event_id: Uuid::new_v4(),
-        aggregate_id: Uuid::new_v4(), // Different aggregate
         aggregate_type: "Foo".to_string(),
         event_type: "Fooed".to_string(),
         body: json!({ "an": "object" }),
         metadata: json!({ "an": "object" }),
-        created_at: Utc::now(),
     };
 
-    event_store.sink(event_1).unwrap();
-    event_store.sink(event_2).unwrap();
-    event_store.sink(event_3).unwrap();
+    let aggregate_id_1 = Uuid::new_v4();
+    let aggregate_id_2 = Uuid::new_v4();
 
-    dbg!(event_store.for_aggregate(aggregate_id));
+    event_store.sink(event_1, aggregate_id_1).unwrap();
+    event_store.sink(event_2, aggregate_id_1).unwrap();
+    event_store.sink(event_3, aggregate_id_2).unwrap();
+
+    dbg!(event_store.for_aggregate(aggregate_id_1));
     eprintln!("--------------------------------------------------------------------------------");
     dbg!(event_store.after(1));
 }
