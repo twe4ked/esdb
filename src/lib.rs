@@ -71,6 +71,8 @@ impl EventStore {
             let event_id = Uuid::new_v4();
 
             // KEY: aggregate_id + aggregate_sequence
+            //
+            // We need to ensure this key is unique otherwise we have a "stale aggregate".
             let aggregates_key: Vec<u8> = aggregate_id
                 .as_bytes()
                 .clone()
@@ -132,6 +134,10 @@ impl EventStore {
             .collect()
     }
 
+    // TODO: We need to ensure that events are never read out of order here.
+    //
+    // For example, if events with sequences 1 and 2 are being written concurrently and event 2
+    // finishes writing first, we need to ensure that we don't see event 2 here before event 1.
     pub fn after(&self, sequence: u64) -> Vec<Event> {
         let events = self.db.open_tree("events").unwrap();
         let sequences = self.db.open_tree("sequences").unwrap();
