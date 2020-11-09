@@ -1,7 +1,6 @@
 use chrono::prelude::*;
 use serde::{Deserialize, Serialize};
 use serde_json::value::Value as JsonValue;
-use sled::transaction::Transactional;
 use sled::{Config, Db};
 use uuid::Uuid;
 
@@ -58,62 +57,84 @@ impl EventStore {
     // TODO: This should take a list of events and sink them as part of the same transaction.
     // The API should be designed in a way that makes it impossible to sink events to different
     // aggregates.
-    pub fn sink(
-        &self,
-        new_event: NewEvent,
-        aggregate_id: Uuid,
-    ) -> sled::transaction::TransactionResult<()> {
+    pub fn sink(&self, new_event: NewEvent, aggregate_id: Uuid) -> std::io::Result<()> {
         let aggregates = self.db.open_tree("aggregates").unwrap();
         let sequences = self.db.open_tree("sequences").unwrap();
         let events = self.db.open_tree("events").unwrap();
 
-        (&aggregates, &sequences, &events).transaction(|(aggregates, sequences, events)| {
-            let event_id = Uuid::new_v4();
+        let event_id = Uuid::new_v4();
 
-            // KEY: aggregate_id + aggregate_sequence
-            //
-            // We need to ensure this key is unique otherwise we have a "stale aggregate".
-            let aggregates_key: Vec<u8> = aggregate_id
-                .as_bytes()
-                .clone()
-                .iter()
-                .chain(new_event.aggregate_sequence.to_be_bytes().iter())
-                .copied()
-                .collect();
-            aggregates.insert(
+        // KEY: aggregate_id + aggregate_sequence
+        //
+        // We need to ensure this key is unique otherwise we have a "stale aggregate".
+        let aggregates_key: Vec<u8> = aggregate_id
+            .as_bytes()
+            .clone()
+            .iter()
+            .chain(new_event.aggregate_sequence.to_be_bytes().iter())
+            .copied()
+            .collect();
+        aggregates
+            .insert(
                 &to_key(aggregates_key),
                 serde_json::to_vec(&EventId(event_id)).unwrap(),
-            )?;
+            )
+            .unwrap();
 
-            // NOTE: Starts at 0 so we're adding 1.
-            let event_sequence = sequences.generate_id().unwrap() + 1;
+        fn increment(old: Option<&[u8]>) -> Option<Vec<u8>> {
+            use std::convert::TryInto;
 
-            // KEY: sequence
-            sequences.insert(
-                &event_sequence.to_be_bytes(),
-                serde_json::to_vec(&EventId(event_id)).unwrap(),
-            )?;
-
-            let event = Event {
-                sequence: event_sequence,
-                aggregate_sequence: new_event.aggregate_sequence.clone(),
-                event_id,
-                aggregate_id: aggregate_id,
-                aggregate_type: new_event.aggregate_type.clone(),
-                event_type: new_event.event_type.clone(),
-                created_at: Utc::now(),
-                body: new_event.body.clone(),
-                metadata: new_event.metadata.clone(),
+            let number = match old {
+                Some(bytes) => {
+                    let array: [u8; 8] = bytes.try_into().unwrap();
+                    let number = u64::from_be_bytes(array);
+                    number + 1
+                }
+                None => 1,
             };
 
-            // KEY: event_id
-            events.insert(
+            Some(number.to_be_bytes().to_vec())
+        }
+
+        let sequence = self.db.open_tree("sequence").unwrap();
+        let event_sequence = sequence
+            .update_and_fetch("sequence", increment)
+            .unwrap()
+            .unwrap();
+
+        // KEY: sequence
+        sequences
+            .insert(
+                &event_sequence,
+                serde_json::to_vec(&EventId(event_id)).unwrap(),
+            )
+            .unwrap();
+
+        let sequence = {
+            use std::convert::TryInto;
+            let array: [u8; 8] = (*event_sequence).try_into().unwrap();
+            u64::from_be_bytes(array)
+        };
+
+        let event = Event {
+            sequence,
+            aggregate_sequence: new_event.aggregate_sequence.clone(),
+            event_id,
+            aggregate_id: aggregate_id,
+            aggregate_type: new_event.aggregate_type.clone(),
+            event_type: new_event.event_type.clone(),
+            created_at: Utc::now(),
+            body: new_event.body.clone(),
+            metadata: new_event.metadata.clone(),
+        };
+
+        // KEY: event_id
+        events
+            .insert(
                 &event_id.as_bytes().clone(),
                 serde_json::to_vec(&event).unwrap(),
-            )?;
-
-            Ok(())
-        })?;
+            )
+            .unwrap();
 
         Ok(())
     }
