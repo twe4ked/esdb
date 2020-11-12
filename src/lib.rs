@@ -4,6 +4,9 @@ use serde_json::value::Value as JsonValue;
 use sled::{Config, Db};
 use uuid::Uuid;
 
+use std::collections::HashSet;
+use std::sync::{Arc, RwLock};
+
 pub struct NewEvent {
     pub aggregate_sequence: u64,
     pub aggregate_type: String,
@@ -59,6 +62,7 @@ struct EventId(Uuid);
 
 pub struct EventStore {
     db: Db,
+    in_flight_sequences: Arc<RwLock<HashSet<u64>>>,
 }
 
 fn to_key<T>(v: Vec<T>) -> [T; 24] {
@@ -74,13 +78,14 @@ fn to_key<T>(v: Vec<T>) -> [T; 24] {
 
 impl EventStore {
     pub fn new() -> Self {
-        let db = Config::default().temporary(true).open().unwrap();
-
-        Self { db }
+        Self::new_with_db(Config::default().temporary(true).open().unwrap())
     }
 
     pub fn new_with_db(db: Db) -> Self {
-        Self { db }
+        Self {
+            db,
+            in_flight_sequences: Arc::new(RwLock::new(HashSet::new())),
+        }
     }
 
     // TODO: This should take a list of events and sink them as part of the same transaction.
@@ -147,6 +152,12 @@ impl EventStore {
             u64::from_be_bytes(array)
         };
 
+        {
+            // TODO: This write blocks, so we want to swap this out with something more performant.
+            let mut w = self.in_flight_sequences.write().unwrap();
+            w.insert(sequence);
+        }
+
         let event = Event::from_new_event(new_event, aggregate_id, sequence, event_id);
 
         // KEY: event_id
@@ -156,6 +167,12 @@ impl EventStore {
                 serde_json::to_vec(&event).unwrap(),
             )
             .unwrap();
+
+        {
+            // TODO: This write blocks, so we want to swap this out with something more performant.
+            let mut w = self.in_flight_sequences.write().unwrap();
+            w.remove(&sequence);
+        }
 
         Ok(())
     }
@@ -176,10 +193,6 @@ impl EventStore {
             .collect()
     }
 
-    // TODO: We need to ensure that events are never read out of order here.
-    //
-    // For example, if events with sequences 1 and 2 are being written concurrently and event 2
-    // finishes writing first, we need to ensure that we don't see event 2 here before event 1.
     pub fn after(&self, sequence: u64) -> Vec<Event> {
         let events = self.db.open_tree("events").unwrap();
         let sequences = self.db.open_tree("sequences").unwrap();
@@ -189,13 +202,21 @@ impl EventStore {
 
         let event_ids = sequences.range(sequence.to_be_bytes()..(sequence + 1000).to_be_bytes());
 
+        let in_flight_sequences = self.in_flight_sequences.read().unwrap();
+
         event_ids
+            // Turn event IDs into EventId(Uuid)
             .map(|event_id| -> EventId {
                 let (_k, event_id) = event_id.unwrap();
                 serde_json::from_slice(&event_id).unwrap()
             })
+            // Turn into Uuid into bytes and look up Events (returned as JSON)
             .map(|event_id| events.get(event_id.0.as_bytes()).unwrap())
-            .map(|e| -> Event { serde_json::from_slice(&e.unwrap()).unwrap() })
+            // Decode into Events
+            .filter_map(|e| e)
+            .map(|e| -> Event { serde_json::from_slice(&e).expect("decode error") })
+            // Filter
+            .filter(|e| in_flight_sequences.iter().any(|ifs| !(ifs < &e.sequence)))
             .collect()
     }
 }
