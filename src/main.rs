@@ -1,43 +1,69 @@
-use serde_json::json;
 use sled::Config;
 use uuid::Uuid;
+use warp::http::StatusCode;
+use warp::Filter;
 
 use esdb::{EventStore, NewEvent};
 
-fn main() {
+// POST /sink/:aggregate_id
+fn sink(
+    event_store: EventStore,
+) -> impl Filter<Extract = impl warp::Reply, Error = warp::Rejection> + Clone {
+    warp::post()
+        .and(warp::path("sink"))
+        .and(warp::path::param::<Uuid>())
+        // Only accept bodies smaller than 16kb...
+        .and(warp::body::content_length_limit(1024 * 16))
+        .and(warp::body::json())
+        .map(move |aggregate_id, mut events: Vec<NewEvent>| {
+            // TODO: Sink multiple events.
+            event_store
+                .sink(events.pop().unwrap(), aggregate_id)
+                .unwrap();
+            Ok(StatusCode::NO_CONTENT)
+        })
+}
+
+// GET /after/:sequence
+fn after(
+    event_store: EventStore,
+) -> impl Filter<Extract = impl warp::Reply, Error = warp::Rejection> + Clone {
+    warp::get()
+        .and(warp::path("after"))
+        .and(warp::path::param::<u64>())
+        .map(move |sequence| {
+            let events = event_store.after(sequence);
+            warp::reply::json(&events)
+        })
+}
+
+// GET /aggregate/:aggregate_id
+fn aggregate(
+    event_store: EventStore,
+) -> impl Filter<Extract = impl warp::Reply, Error = warp::Rejection> + Clone {
+    warp::get()
+        .and(warp::path("aggregate"))
+        .and(warp::path::param::<Uuid>())
+        .map(move |aggregate_id| {
+            let events = event_store.for_aggregate(aggregate_id);
+            warp::reply::json(&events)
+        })
+}
+
+pub fn routes(
+    event_store: EventStore,
+) -> impl Filter<Extract = impl warp::Reply, Error = warp::Rejection> + Clone {
+    sink(event_store.clone())
+        .or(after(event_store.clone()))
+        .or(aggregate(event_store))
+}
+
+#[tokio::main]
+async fn main() {
     let db = Config::default().temporary(true).open().unwrap();
     let event_store = EventStore::new_with_db(db);
 
-    let event_1 = NewEvent {
-        aggregate_sequence: 1,
-        aggregate_type: "Foo".to_string(),
-        event_type: "Fooed".to_string(),
-        body: json!({ "an": "object" }),
-        metadata: json!({ "an": "object" }),
-    };
-    let event_2 = NewEvent {
-        aggregate_sequence: 2,
-        aggregate_type: "Foo".to_string(),
-        event_type: "Fooed".to_string(),
-        body: json!({ "an": "object" }),
-        metadata: json!({ "an": "object" }),
-    };
-    let event_3 = NewEvent {
-        aggregate_sequence: 1,
-        aggregate_type: "Foo".to_string(),
-        event_type: "Fooed".to_string(),
-        body: json!({ "an": "object" }),
-        metadata: json!({ "an": "object" }),
-    };
-
-    let aggregate_id_1 = Uuid::new_v4();
-    let aggregate_id_2 = Uuid::new_v4();
-
-    event_store.sink(event_1, aggregate_id_1).unwrap();
-    event_store.sink(event_2, aggregate_id_1).unwrap();
-    event_store.sink(event_3, aggregate_id_2).unwrap();
-
-    dbg!(event_store.for_aggregate(aggregate_id_1));
-    eprintln!("--------------------------------------------------------------------------------");
-    dbg!(event_store.after(1));
+    warp::serve(routes(event_store))
+        .run(([127, 0, 0, 1], 3030))
+        .await
 }

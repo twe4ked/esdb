@@ -7,6 +7,7 @@ use uuid::Uuid;
 use std::collections::HashSet;
 use std::sync::{Arc, RwLock};
 
+#[derive(Deserialize, Serialize, Debug, PartialEq, Clone)]
 pub struct NewEvent {
     pub aggregate_sequence: u64,
     pub aggregate_type: String,
@@ -60,6 +61,7 @@ impl Event {
 #[derive(Deserialize, Serialize, Debug, PartialEq, Clone)]
 struct EventId(Uuid);
 
+#[derive(Clone)]
 pub struct EventStore {
     db: Db,
     in_flight_sequences: Arc<RwLock<HashSet<u64>>>,

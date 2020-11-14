@@ -11,3 +11,5 @@ sled-extensions = { version = "0.2.0", features = ["json"] }
 serde = "1.0.117"
 uuid = { version = "0.8.1", features = ["serde", "v4"] }
 chrono = "0.4.19"
+warp = "0.2.5"
+tokio = { version = "0.2", features = ["full"] }
