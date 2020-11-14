@@ -17,7 +17,9 @@ def sink_event(aggregate_id)
       metadata: {}
     }
   ].to_json
-  response = Net::HTTP.start(url.host, url.port) { |http| http.request(request) }
+  Net::HTTP.start(url.host, url.port) { |http| http.request(request) }
+rescue Errno::EPIPE => e
+  p e
 end
 
 def after_events(sequence)
@@ -30,7 +32,7 @@ end
 stop = false
 Signal.trap(:INT) { stop = true }
 
-pids = 10.times.map do |n|
+pids = 20.times.map do |n|
   fork do
     until stop
       sink_event(SecureRandom.uuid)
@@ -69,14 +71,26 @@ loop do
   if stop
     puts "Waiting for remaining events..."
     Process.waitall
-    break if after_events(bookmark).empty?
+    if after_events(bookmark).empty?
+      sleep 1
+      if after_events(bookmark).empty?
+        break
+      end
+    end
   end
 end
 
 # Check sequence numbers we processed against the sequence numbers from the
 # event store.
 
-actual_sequences = after_events(bookmark).map { |e| e["sequence"] }
+actual_sequences = []
+bookmark = 0
+loop do
+  new = after_events(bookmark).map { |e| e["sequence"] }
+  bookmark = new.max
+  actual_sequences += new
+  break if new.empty?
+end
 
 puts "actual sequences:\t#{actual_sequences.count}"
 puts "processed sequences:\t#{processed_sequences.count}"
