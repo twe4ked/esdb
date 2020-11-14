@@ -46,14 +46,14 @@ impl Event {
 
         Event {
             sequence,
-            aggregate_sequence: aggregate_sequence,
+            aggregate_sequence,
             event_id,
-            aggregate_id: aggregate_id,
-            aggregate_type: aggregate_type,
-            event_type: event_type,
+            aggregate_id,
+            aggregate_type,
+            event_type,
             created_at: Utc::now(),
-            body: body,
-            metadata: metadata,
+            body,
+            metadata,
         }
     }
 }
@@ -218,7 +218,7 @@ impl EventStore {
             .filter_map(|e| e)
             .map(|e| -> Event { serde_json::from_slice(&e).expect("decode error") })
             // Filter
-            .filter(|e| in_flight_sequences.iter().any(|ifs| !(ifs < &e.sequence)))
+            .filter(|e| in_flight_sequences.iter().any(|ifs| ifs >= &e.sequence))
             .collect()
     }
 }
