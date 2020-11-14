@@ -222,3 +222,9 @@ impl EventStore {
             .collect()
     }
 }
+
+impl Default for EventStore {
+    fn default() -> Self {
+        Self::new()
+    }
+}
