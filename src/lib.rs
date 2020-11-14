@@ -119,40 +119,15 @@ impl EventStore {
             .unwrap()
             .expect("stale aggregate");
 
-        fn increment(old: Option<&[u8]>) -> Option<Vec<u8>> {
-            use std::convert::TryInto;
-
-            let number = match old {
-                Some(bytes) => {
-                    let array: [u8; 8] = bytes.try_into().unwrap();
-                    let number = u64::from_be_bytes(array);
-                    number + 1
-                }
-                None => 1,
-            };
-
-            Some(number.to_be_bytes().to_vec())
-        }
-
-        let sequence = self.db.open_tree("sequence").unwrap();
-        let event_sequence = sequence
-            .update_and_fetch("sequence", increment)
-            .unwrap()
-            .unwrap();
+        let sequence = self.db.generate_id().unwrap();
 
         // KEY: sequence
         sequences
             .insert(
-                &event_sequence,
+                &sequence.to_be_bytes(),
                 serde_json::to_vec(&EventId(event_id)).unwrap(),
             )
             .unwrap();
-
-        let sequence = {
-            use std::convert::TryInto;
-            let array: [u8; 8] = (*event_sequence).try_into().unwrap();
-            u64::from_be_bytes(array)
-        };
 
         {
             // TODO: This write blocks, so we want to swap this out with something more performant.
