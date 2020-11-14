@@ -1,4 +1,5 @@
 use sled::Config;
+use tracing_subscriber::fmt::format::FmtSpan;
 use uuid::Uuid;
 use warp::http::StatusCode;
 use warp::Filter;
@@ -60,10 +61,18 @@ pub fn routes(
 
 #[tokio::main]
 async fn main() {
+    let filter = std::env::var("RUST_LOG").unwrap_or_else(|_| "tracing=info,warp=debug".to_owned());
+
+    tracing_subscriber::fmt()
+        .with_env_filter(filter)
+        // Record an event when each span closes. This can be used to time our route durations
+        .with_span_events(FmtSpan::CLOSE)
+        .init();
+
     let db = Config::default().temporary(true).open().unwrap();
     let event_store = EventStore::new_with_db(db);
 
-    warp::serve(routes(event_store))
+    warp::serve(routes(event_store).with(warp::trace::request()))
         .run(([127, 0, 0, 1], 3030))
         .await
 }
