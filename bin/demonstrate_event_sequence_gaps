@@ -1,0 +1,85 @@
+#!/usr/bin/env ruby
+
+require "net/http"
+require "securerandom"
+require "json"
+
+def sink_event(aggregate_id)
+  url = URI.parse("http://localhost:3030/sink/#{aggregate_id}")
+  request = Net::HTTP::Post.new(url.to_s)
+  request["Content-Type"] = "application/json"
+  request.body = [
+    {
+      aggregate_sequence: 1,
+      aggregate_type: "Foo",
+      event_type: "Bar",
+      body: {},
+      metadata: {}
+    }
+  ].to_json
+  response = Net::HTTP.start(url.host, url.port) { |http| http.request(request) }
+end
+
+def after_events(sequence)
+  url = URI.parse("http://localhost:3030/after/#{sequence}")
+  request = Net::HTTP::Get.new(url.to_s)
+  response = Net::HTTP.start(url.host, url.port) { |http| http.request(request) }
+  JSON.parse(response.body)
+end
+
+stop = false
+Signal.trap(:INT) { stop = true }
+
+pids = 10.times.map do |n|
+  fork do
+    until stop
+      sink_event(SecureRandom.uuid)
+    end
+
+    puts "Fork finishing #{n}"
+  end
+end
+
+# This represents an event processor:
+
+bookmark = 0
+processed_sequences = []
+
+loop do
+  # Get latest events for bookmark
+  events = after_events(bookmark)
+
+  events.each do |event|
+    # Store all sequence numbers
+    processed_sequences << event["sequence"]
+    bookmark = event["sequence"]
+    puts "Processed to #{bookmark}" if (bookmark % 100) == 0
+  end
+
+  if bookmark > 10_000
+    stop = true
+    # Use delete_if and return true so the PID gets removed from the list
+    pids.delete_if do |pid|
+      Process.kill(:INT, pid)
+      true
+    end
+  end
+
+  # Allow the forks to finish and wait for remaining events
+  if stop
+    puts "Waiting for remaining events..."
+    Process.waitall
+    break if after_events(bookmark).empty?
+  end
+end
+
+# Check sequence numbers we processed against the sequence numbers from the
+# event store.
+
+actual_sequences = after_events(bookmark).map { |e| e["sequence"] }
+
+puts "actual sequences:\t#{actual_sequences.count}"
+puts "processed sequences:\t#{processed_sequences.count}"
+puts "unprocessed sequences:\t#{(actual_sequences - processed_sequences).count}"
+
+puts "Done"
