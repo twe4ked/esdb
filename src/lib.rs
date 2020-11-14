@@ -121,6 +121,12 @@ impl EventStore {
 
         let sequence = self.db.generate_id().unwrap();
 
+        {
+            // TODO: This write blocks, so we want to swap this out with something more performant.
+            let mut w = self.in_flight_sequences.write().unwrap();
+            w.insert(sequence);
+        }
+
         // KEY: sequence
         sequences
             .insert(
@@ -128,12 +134,6 @@ impl EventStore {
                 serde_json::to_vec(&EventId(event_id)).unwrap(),
             )
             .unwrap();
-
-        {
-            // TODO: This write blocks, so we want to swap this out with something more performant.
-            let mut w = self.in_flight_sequences.write().unwrap();
-            w.insert(sequence);
-        }
 
         let event = Event::from_new_event(new_event, aggregate_id, sequence, event_id);
 
