@@ -103,11 +103,7 @@ impl EventStore {
         // Start sequence at 1.
         let sequence = self.db.generate_id()? + 1;
 
-        {
-            // TODO: This write blocks, so we want to swap this out with something more performant.
-            let mut w = self.in_flight_sequences.write().unwrap();
-            w.insert(sequence);
-        }
+        self.mark_sequence_in_flight(sequence);
 
         // KEY: aggregate_id + aggregate_sequence
         let aggregates_key: Vec<u8> = aggregate_id
@@ -133,11 +129,7 @@ impl EventStore {
         // KEY: sequence
         events.insert(&sequence.to_be_bytes(), serde_json::to_vec(&event).unwrap())?;
 
-        {
-            // TODO: This write blocks, so we want to swap this out with something more performant.
-            let mut w = self.in_flight_sequences_finished.write().unwrap();
-            w.insert(sequence);
-        }
+        self.mark_sequence_finished(sequence);
 
         Ok(())
     }
@@ -197,5 +189,15 @@ impl EventStore {
             let mut w = self.in_flight_sequences.write().unwrap();
             w.remove(&sequence);
         }
+    }
+
+    fn mark_sequence_in_flight(&self, sequence: u64) {
+        let mut w = self.in_flight_sequences.write().unwrap();
+        w.insert(sequence);
+    }
+
+    fn mark_sequence_finished(&self, sequence: u64) {
+        let mut w = self.in_flight_sequences_finished.write().unwrap();
+        w.insert(sequence);
     }
 }
