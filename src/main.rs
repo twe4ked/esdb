@@ -33,7 +33,7 @@ fn after(
         .and(warp::path("after"))
         .and(warp::path::param::<u64>())
         .map(move |sequence| {
-            let events = event_store.after(sequence);
+            let events = event_store.after(sequence).unwrap();
             warp::reply::json(&events)
         })
 }
@@ -46,7 +46,7 @@ fn aggregate(
         .and(warp::path("aggregate"))
         .and(warp::path::param::<Uuid>())
         .map(move |aggregate_id| {
-            let events = event_store.for_aggregate(aggregate_id);
+            let events = event_store.for_aggregate(aggregate_id).unwrap();
             warp::reply::json(&events)
         })
 }

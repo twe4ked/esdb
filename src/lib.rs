@@ -80,8 +80,9 @@ fn to_key<T>(v: Vec<T>) -> [T; 24] {
 }
 
 impl EventStore {
-    pub fn new() -> Self {
-        Self::new_with_db(Config::default().temporary(true).open().unwrap())
+    pub fn new() -> sled::Result<Self> {
+        let db = Config::default().temporary(true).open()?;
+        Ok(Self::new_with_db(db))
     }
 
     pub fn new_with_db(db: Db) -> Self {
@@ -95,12 +96,12 @@ impl EventStore {
     // TODO: This should take a list of events and sink them as part of the same transaction.
     // The API should be designed in a way that makes it impossible to sink events to different
     // aggregates.
-    pub fn sink(&self, new_event: NewEvent, aggregate_id: Uuid) -> std::io::Result<()> {
-        let aggregates = self.db.open_tree("aggregates").unwrap();
-        let events = self.db.open_tree("events").unwrap();
+    pub fn sink(&self, new_event: NewEvent, aggregate_id: Uuid) -> sled::Result<()> {
+        let aggregates = self.db.open_tree("aggregates")?;
+        let events = self.db.open_tree("events")?;
 
         // Start sequence at 1.
-        let sequence = self.db.generate_id().unwrap() + 1;
+        let sequence = self.db.generate_id()? + 1;
 
         {
             // TODO: This write blocks, so we want to swap this out with something more performant.
@@ -123,17 +124,14 @@ impl EventStore {
                 &to_key(aggregates_key),
                 None as Option<&[u8]>,
                 Some(serde_json::to_vec(&sequence).unwrap()),
-            )
-            .unwrap()
+            )?
             .expect("stale aggregate");
 
         let event_id = Uuid::new_v4(); // TODO: Ensure uniqueness
         let event = Event::from_new_event(new_event, aggregate_id, sequence, event_id);
 
         // KEY: sequence
-        events
-            .insert(&sequence.to_be_bytes(), serde_json::to_vec(&event).unwrap())
-            .unwrap();
+        events.insert(&sequence.to_be_bytes(), serde_json::to_vec(&event).unwrap())?;
 
         {
             // TODO: This write blocks, so we want to swap this out with something more performant.
@@ -144,20 +142,20 @@ impl EventStore {
         Ok(())
     }
 
-    pub fn for_aggregate(&self, aggregate_id: Uuid) -> Vec<Event> {
-        let events = self.db.open_tree("events").unwrap();
-        let aggregates = self.db.open_tree("aggregates").unwrap();
+    pub fn for_aggregate(&self, aggregate_id: Uuid) -> sled::Result<Vec<Event>> {
+        let events = self.db.open_tree("events")?;
+        let aggregates = self.db.open_tree("aggregates")?;
 
-        aggregates
+        Ok(aggregates
             .scan_prefix(&aggregate_id.as_bytes())
             .filter_map(|e| e.ok())
             .map(|(_, s)| -> u64 { serde_json::from_slice(&s).expect("decode error") })
             .map(|s| events.get(&s.to_be_bytes()).unwrap())
             .map(|e| -> Event { serde_json::from_slice(&e.unwrap()).unwrap() })
-            .collect()
+            .collect())
     }
 
-    pub fn after(&self, sequence: u64) -> Vec<Event> {
+    pub fn after(&self, sequence: u64) -> sled::Result<Vec<Event>> {
         // We want events _after_ this sequence.
         let sequence = sequence + 1;
 
@@ -169,10 +167,9 @@ impl EventStore {
         // Fetch the events and convert them info `Event`s
         let events = self
             .db
-            .open_tree("events")
-            .unwrap()
+            .open_tree("events")?
             .range(sequence.to_be_bytes()..(sequence + 1000).to_be_bytes())
-            .filter_map(|e| e.ok())
+            .map(|e| e.unwrap())
             .map(|(_, e)| -> Event { serde_json::from_slice(&e).expect("decode error") });
 
         // Read any in-flight sequences that are still in-flight. N.b. we're not removing any
@@ -189,9 +186,9 @@ impl EventStore {
         if let Some(s) = min_in_flight_sequence {
             // If we have any in-flight sequences we want to filter out any events that are after
             // the min in-flight sequence
-            events.filter(|e| e.sequence < s).collect()
+            Ok(events.filter(|e| e.sequence < s).collect())
         } else {
-            events.collect()
+            Ok(events.collect())
         }
     }
 
@@ -200,11 +197,5 @@ impl EventStore {
             let mut w = self.in_flight_sequences.write().unwrap();
             w.remove(&sequence);
         }
-    }
-}
-
-impl Default for EventStore {
-    fn default() -> Self {
-        Self::new()
     }
 }
