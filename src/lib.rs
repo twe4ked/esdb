@@ -65,6 +65,7 @@ struct EventId(Uuid);
 pub struct EventStore {
     db: Db,
     in_flight_sequences: Arc<RwLock<HashSet<u64>>>,
+    in_flight_sequences_finished: Arc<RwLock<HashSet<u64>>>,
 }
 
 fn to_key<T>(v: Vec<T>) -> [T; 24] {
@@ -87,6 +88,7 @@ impl EventStore {
         Self {
             db,
             in_flight_sequences: Arc::new(RwLock::new(HashSet::new())),
+            in_flight_sequences_finished: Arc::new(RwLock::new(HashSet::new())),
         }
     }
 
@@ -95,10 +97,16 @@ impl EventStore {
     // aggregates.
     pub fn sink(&self, new_event: NewEvent, aggregate_id: Uuid) -> std::io::Result<()> {
         let aggregates = self.db.open_tree("aggregates").unwrap();
-        let sequences = self.db.open_tree("sequences").unwrap();
         let events = self.db.open_tree("events").unwrap();
 
-        let event_id = Uuid::new_v4();
+        // Start sequence at 1.
+        let sequence = self.db.generate_id().unwrap() + 1;
+
+        {
+            // TODO: This write blocks, so we want to swap this out with something more performant.
+            let mut w = self.in_flight_sequences.write().unwrap();
+            w.insert(sequence);
+        }
 
         // KEY: aggregate_id + aggregate_sequence
         let aggregates_key: Vec<u8> = aggregate_id
@@ -114,41 +122,23 @@ impl EventStore {
             .compare_and_swap(
                 &to_key(aggregates_key),
                 None as Option<&[u8]>,
-                Some(serde_json::to_vec(&EventId(event_id)).unwrap()),
+                Some(serde_json::to_vec(&sequence).unwrap()),
             )
             .unwrap()
             .expect("stale aggregate");
 
-        let sequence = self.db.generate_id().unwrap();
-
-        {
-            // TODO: This write blocks, so we want to swap this out with something more performant.
-            let mut w = self.in_flight_sequences.write().unwrap();
-            w.insert(sequence);
-        }
-
-        // KEY: sequence
-        sequences
-            .insert(
-                &sequence.to_be_bytes(),
-                serde_json::to_vec(&EventId(event_id)).unwrap(),
-            )
-            .unwrap();
-
+        let event_id = Uuid::new_v4(); // TODO: Ensure uniqueness
         let event = Event::from_new_event(new_event, aggregate_id, sequence, event_id);
 
-        // KEY: event_id
+        // KEY: sequence
         events
-            .insert(
-                &event_id.as_bytes().clone(),
-                serde_json::to_vec(&event).unwrap(),
-            )
+            .insert(&sequence.to_be_bytes(), serde_json::to_vec(&event).unwrap())
             .unwrap();
 
         {
             // TODO: This write blocks, so we want to swap this out with something more performant.
-            let mut w = self.in_flight_sequences.write().unwrap();
-            w.remove(&sequence);
+            let mut w = self.in_flight_sequences_finished.write().unwrap();
+            w.insert(sequence);
         }
 
         Ok(())
@@ -158,43 +148,58 @@ impl EventStore {
         let events = self.db.open_tree("events").unwrap();
         let aggregates = self.db.open_tree("aggregates").unwrap();
 
-        let event_ids = aggregates.scan_prefix(&aggregate_id.as_bytes());
-
-        event_ids
-            .map(|event_id| -> EventId {
-                let (_k, event_id) = event_id.unwrap();
-                serde_json::from_slice(&event_id).unwrap()
-            })
-            .map(|event_id| events.get(event_id.0.as_bytes()).unwrap())
+        aggregates
+            .scan_prefix(&aggregate_id.as_bytes())
+            .filter_map(|e| e.ok())
+            .map(|(_, s)| -> u64 { serde_json::from_slice(&s).expect("decode error") })
+            .map(|s| events.get(&s.to_be_bytes()).unwrap())
             .map(|e| -> Event { serde_json::from_slice(&e.unwrap()).unwrap() })
             .collect()
     }
 
     pub fn after(&self, sequence: u64) -> Vec<Event> {
-        let events = self.db.open_tree("events").unwrap();
-        let sequences = self.db.open_tree("sequences").unwrap();
-
         // We want events _after_ this sequence.
         let sequence = sequence + 1;
 
-        let event_ids = sequences.range(sequence.to_be_bytes()..(sequence + 1000).to_be_bytes());
+        // Remove any sequences that are no longer in flight
+        self.remove_finished_in_flight_sequences();
+        // Then read any sequences that are still in-flight,
+        let in_flight_sequences_before = self.in_flight_sequences.read().unwrap().clone();
 
-        let in_flight_sequences = self.in_flight_sequences.read().unwrap();
+        // Fetch the events and convert them info `Event`s
+        let events = self
+            .db
+            .open_tree("events")
+            .unwrap()
+            .range(sequence.to_be_bytes()..(sequence + 1000).to_be_bytes())
+            .filter_map(|e| e.ok())
+            .map(|(_, e)| -> Event { serde_json::from_slice(&e).expect("decode error") });
 
-        event_ids
-            // Turn event IDs into EventId(Uuid)
-            .map(|event_id| -> EventId {
-                let (_k, event_id) = event_id.unwrap();
-                serde_json::from_slice(&event_id).unwrap()
-            })
-            // Turn into Uuid into bytes and look up Events (returned as JSON)
-            .map(|event_id| events.get(event_id.0.as_bytes()).unwrap())
-            // Decode into Events
-            .filter_map(|e| e)
-            .map(|e| -> Event { serde_json::from_slice(&e).expect("decode error") })
-            // Filter
-            .filter(|e| in_flight_sequences.iter().any(|ifs| ifs >= &e.sequence))
-            .collect()
+        // Read any in-flight sequences that are still in-flight. N.b. we're not removing any
+        // sequences that were in-flight in case any were added while we were reading events.
+        let in_flight_sequences_after = self.in_flight_sequences.read().unwrap();
+
+        // Find the min in-flight sequence
+        let min_in_flight_sequence = in_flight_sequences_before
+            .iter()
+            .chain(in_flight_sequences_after.iter())
+            .min()
+            .copied();
+
+        if let Some(s) = min_in_flight_sequence {
+            // If we have any in-flight sequences we want to filter out any events that are after
+            // the min in-flight sequence
+            events.filter(|e| e.sequence < s).collect()
+        } else {
+            events.collect()
+        }
+    }
+
+    fn remove_finished_in_flight_sequences(&self) {
+        for sequence in self.in_flight_sequences_finished.read().unwrap().iter() {
+            let mut w = self.in_flight_sequences.write().unwrap();
+            w.remove(&sequence);
+        }
     }
 }
 
