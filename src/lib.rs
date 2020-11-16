@@ -5,7 +5,8 @@ use sled::{Config, Db};
 use uuid::Uuid;
 
 use std::collections::HashSet;
-use std::sync::{Arc, RwLock};
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Mutex, RwLock};
 
 #[derive(Deserialize, Serialize, Debug, PartialEq, Clone)]
 pub struct NewEvent {
@@ -64,8 +65,7 @@ struct EventId(Uuid);
 #[derive(Clone)]
 pub struct EventStore {
     db: Db,
-    in_flight_sequences: Arc<RwLock<HashSet<u64>>>,
-    in_flight_sequences_finished: Arc<RwLock<HashSet<u64>>>,
+    sequences: Sequences,
 }
 
 fn to_key<T>(v: Vec<T>) -> [T; 24] {
@@ -88,8 +88,7 @@ impl EventStore {
     pub fn new_with_db(db: Db) -> Self {
         Self {
             db,
-            in_flight_sequences: Arc::new(RwLock::new(HashSet::new())),
-            in_flight_sequences_finished: Arc::new(RwLock::new(HashSet::new())),
+            sequences: Sequences::new(),
         }
     }
 
@@ -100,10 +99,7 @@ impl EventStore {
         let aggregates = self.db.open_tree("aggregates")?;
         let events = self.db.open_tree("events")?;
 
-        // Start sequence at 1.
-        let sequence = self.db.generate_id()? + 1;
-
-        self.mark_sequence_in_flight(sequence);
+        let sequence = self.sequences.generate(&self.db)?;
 
         // KEY: aggregate_id + aggregate_sequence
         let aggregates_key: Vec<u8> = aggregate_id
@@ -129,7 +125,7 @@ impl EventStore {
         // KEY: sequence
         events.insert(&sequence.to_be_bytes(), serde_json::to_vec(&event).unwrap())?;
 
-        self.mark_sequence_finished(sequence);
+        self.sequences.mark_sequence_finished(sequence);
 
         Ok(())
     }
@@ -151,10 +147,7 @@ impl EventStore {
         // We want events _after_ this sequence.
         let sequence = sequence + 1;
 
-        // Remove any sequences that are no longer in flight
-        self.remove_finished_in_flight_sequences();
-        // Then read any sequences that are still in-flight,
-        let in_flight_sequences_before = self.in_flight_sequences.read().unwrap().clone();
+        self.sequences.start_reading();
 
         // Fetch the events and convert them info `Event`s
         let events = self
@@ -164,40 +157,107 @@ impl EventStore {
             .map(|e| e.unwrap())
             .map(|(_, e)| -> Event { serde_json::from_slice(&e).expect("decode error") });
 
-        // Read any in-flight sequences that are still in-flight. N.b. we're not removing any
-        // sequences that were in-flight in case any were added while we were reading events.
-        let in_flight_sequences_after = self.in_flight_sequences.read().unwrap();
+        // Read any in-flight sequences that are still in-flight and find the min in-flight
+        // sequence
+        let min_in_flight_sequence = self.sequences.min_in_flight_sequence();
 
-        // Find the min in-flight sequence
-        let min_in_flight_sequence = in_flight_sequences_before
-            .iter()
-            .chain(in_flight_sequences_after.iter())
-            .min()
-            .copied();
+        // We've now read the events and any in-flight sequences so we can allow removing
+        // in-flight sequences again.
+        self.sequences.finished_reading();
 
         if let Some(s) = min_in_flight_sequence {
-            // If we have any in-flight sequences we want to filter out any events that are after
+            // If we have any in-flight sequences, we want to filter out any events that are after
             // the min in-flight sequence
             Ok(events.filter(|e| e.sequence < s).collect())
         } else {
             Ok(events.collect())
         }
     }
+}
 
-    fn remove_finished_in_flight_sequences(&self) {
-        for sequence in self.in_flight_sequences_finished.read().unwrap().iter() {
+#[derive(Clone)]
+struct Sequences {
+    in_flight_sequences: Arc<RwLock<HashSet<u64>>>,
+    finished_sequences: Arc<RwLock<HashSet<u64>>>,
+    readers_count: Arc<AtomicU64>,
+    generate_sequence_lock: Arc<Mutex<()>>,
+}
+
+impl Sequences {
+    fn new() -> Self {
+        Self {
+            // List of in-flight sequences
+            in_flight_sequences: Arc::new(RwLock::new(HashSet::new())),
+            // List of sequences that have been marked as "finished" ready for removal
+            finished_sequences: Arc::new(RwLock::new(HashSet::new())),
+            // Number of threads currently reading. This is used to ensure we don't remove
+            // in-flight sequences while threads might be using them.
+            readers_count: Arc::new(AtomicU64::new(0)),
+            // Used to ensure newly generated sequences is marked as in-flight before they're used.
+            generate_sequence_lock: Arc::new(Mutex::new(())),
+        }
+    }
+
+    fn min_in_flight_sequence(&self) -> Option<u64> {
+        self.in_flight_sequences
+            .read()
+            .unwrap()
+            .iter()
+            .min()
+            .copied()
+    }
+
+    fn start_reading(&self) {
+        self.try_remove_finished_in_flight_sequences();
+
+        // While we have the "removing" lock we know that no other threads are removing
+        // sequences. This means we're safe to increment "readers_count"
+        // which will prevent other threads from removing in-flight sequences while we're
+        // reading.
+        //
+        // Lock removing of in-flight sequences while we fetch events
+        self.readers_count.fetch_add(1, Ordering::SeqCst);
+    }
+
+    fn try_remove_finished_in_flight_sequences(&self) {
+        // Read the finished sequences first
+        let finished_sequences = self.finished_sequences.read().unwrap();
+
+        // If there are no other readers we're safe to remove in-flight sequences
+        if self.readers_count.load(Ordering::SeqCst) == 0 {
             let mut w = self.in_flight_sequences.write().unwrap();
-            w.remove(&sequence);
+
+            // Remove any sequences that are no longer in flight
+            for sequence in finished_sequences.iter() {
+                w.remove(&sequence);
+            }
         }
     }
 
     fn mark_sequence_in_flight(&self, sequence: u64) {
-        let mut w = self.in_flight_sequences.write().unwrap();
-        w.insert(sequence);
+        self.in_flight_sequences.write().unwrap().insert(sequence);
     }
 
     fn mark_sequence_finished(&self, sequence: u64) {
-        let mut w = self.in_flight_sequences_finished.write().unwrap();
-        w.insert(sequence);
+        self.finished_sequences.write().unwrap().insert(sequence);
+    }
+
+    fn finished_reading(&self) {
+        self.readers_count.fetch_sub(1, Ordering::SeqCst);
+    }
+
+    /// When generating a sequence we need to do it in a lock so that we can be sure that no other
+    /// IDs get generated before we mark the new sequence as in-flight.
+    fn generate(&self, db: &Db) -> sled::Result<u64> {
+        match self.generate_sequence_lock.lock() {
+            Ok(_) => {
+                let sequence = db.generate_id()?;
+                // Start sequence at 1.
+                let sequence = sequence + 1;
+                self.mark_sequence_in_flight(sequence);
+                Ok(sequence)
+            }
+            Err(e) => panic!("{}", e),
+        }
     }
 }
