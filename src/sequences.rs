@@ -86,6 +86,7 @@ impl Sequences {
     }
 }
 
+#[must_use]
 pub struct NewSequence<'a> {
     pub value: u64,
     sequences: &'a Sequences,
