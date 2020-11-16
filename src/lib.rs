@@ -101,17 +101,18 @@ impl EventStore {
             .compare_and_swap(
                 &aggregates_key,
                 None as Option<&[u8]>,
-                Some(serde_json::to_vec(&sequence).unwrap()),
+                Some(serde_json::to_vec(&sequence.value).unwrap()),
             )?
             .expect("stale aggregate");
 
         let event_id = Uuid::new_v4(); // TODO: Ensure uniqueness
-        let event = Event::from_new_event(new_event, aggregate_id, sequence, event_id);
+        let event = Event::from_new_event(new_event, aggregate_id, sequence.value, event_id);
 
         // KEY: sequence
-        events.insert(&sequence.to_be_bytes(), serde_json::to_vec(&event).unwrap())?;
-
-        self.sequences.mark_sequence_finished(sequence);
+        events.insert(
+            &sequence.value.to_be_bytes(),
+            serde_json::to_vec(&event).unwrap(),
+        )?;
 
         Ok(())
     }
@@ -231,16 +232,33 @@ impl Sequences {
 
     /// When generating a sequence we need to do it in a lock so that we can be sure that no other
     /// IDs get generated before we mark the new sequence as in-flight.
-    fn generate(&self, db: &Db) -> sled::Result<u64> {
+    fn generate(&self, db: &Db) -> sled::Result<NewSequence> {
         match self.generate_sequence_lock.lock() {
             Ok(_) => {
                 let sequence = db.generate_id()?;
                 // Start sequence at 1.
                 let sequence = sequence + 1;
                 self.mark_sequence_in_flight(sequence);
-                Ok(sequence)
+                Ok(NewSequence::new(sequence, &self))
             }
             Err(e) => panic!("{}", e),
         }
+    }
+}
+
+struct NewSequence<'a> {
+    value: u64,
+    sequences: &'a Sequences,
+}
+
+impl<'a> NewSequence<'a> {
+    fn new(value: u64, sequences: &'a Sequences) -> Self {
+        Self { value, sequences }
+    }
+}
+
+impl Drop for NewSequence<'_> {
+    fn drop(&mut self) {
+        self.sequences.mark_sequence_finished(self.value);
     }
 }
