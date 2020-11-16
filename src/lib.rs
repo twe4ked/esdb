@@ -140,9 +140,10 @@ impl EventStore {
         let mut events: Vec<_> = self
             .db
             .open_tree("events")?
-            .range(sequence.to_be_bytes()..(sequence + 1000).to_be_bytes())
+            .range(sequence.to_be_bytes()..)
             .map(|e| e.unwrap())
             .map(|(_, e)| -> Event { serde_json::from_slice(&e).expect("decode error") })
+            .take(1000)
             .collect();
 
         // Read any in-flight sequences that are still in-flight and find the min in-flight
