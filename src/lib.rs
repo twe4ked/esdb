@@ -68,17 +68,6 @@ pub struct EventStore {
     sequences: Sequences,
 }
 
-fn to_key<T>(v: Vec<T>) -> [T; 24] {
-    use std::convert::TryInto;
-
-    let boxed_slice = v.into_boxed_slice();
-    let boxed_array: Box<[T; 24]> = match boxed_slice.try_into() {
-        Ok(ba) => ba,
-        Err(o) => panic!("Expected a Vec of length {} but it was {}", 24, o.len()),
-    };
-    *boxed_array
-}
-
 impl EventStore {
     pub fn new() -> sled::Result<Self> {
         let db = Config::default().temporary(true).open()?;
@@ -102,18 +91,13 @@ impl EventStore {
         let sequence = self.sequences.generate(&self.db)?;
 
         // KEY: aggregate_id + aggregate_sequence
-        let aggregates_key: Vec<u8> = aggregate_id
-            .as_bytes()
-            .clone()
-            .iter()
-            .chain(new_event.aggregate_sequence.to_be_bytes().iter())
-            .copied()
-            .collect();
-        // The compare_and_swap here ensure the aggregate_id + aggregate_sequence is unique so we
-        // can be sure we don't have a stale aggregate.
+        let mut aggregates_key = aggregate_id.as_bytes().to_vec();
+        aggregates_key.extend_from_slice(&new_event.aggregate_sequence.to_be_bytes());
         aggregates
+            // The compare_and_swap here ensure the aggregate_id + aggregate_sequence is unique so we
+            // can be sure we don't have a stale aggregate.
             .compare_and_swap(
-                &to_key(aggregates_key),
+                &aggregates_key,
                 None as Option<&[u8]>,
                 Some(serde_json::to_vec(&sequence).unwrap()),
             )?
