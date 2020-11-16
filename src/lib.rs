@@ -8,6 +8,8 @@ use std::collections::HashSet;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
 
+const DEFAULT_LIMIT: usize = 1000;
+
 #[derive(Deserialize, Serialize, Debug, PartialEq, Clone)]
 pub struct NewEvent {
     pub aggregate_sequence: u64,
@@ -127,9 +129,11 @@ impl EventStore {
             .collect())
     }
 
-    pub fn after(&self, sequence: u64) -> sled::Result<Vec<Event>> {
+    pub fn after(&self, sequence: u64, limit: Option<usize>) -> sled::Result<Vec<Event>> {
         // We want events _after_ this sequence.
         let sequence = sequence + 1;
+
+        let limit = limit.unwrap_or(DEFAULT_LIMIT);
 
         // After this call, sequences can't start being removed, unless they're already in the
         // process of being removed, which is okay because they must already be finished.
@@ -143,7 +147,7 @@ impl EventStore {
             .range(sequence.to_be_bytes()..)
             .map(|e| e.unwrap())
             .map(|(_, e)| -> Event { serde_json::from_slice(&e).expect("decode error") })
-            .take(1000)
+            .take(limit)
             .collect();
 
         // Read any in-flight sequences that are still in-flight and find the min in-flight

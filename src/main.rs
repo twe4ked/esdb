@@ -1,3 +1,4 @@
+use serde::{Deserialize, Serialize};
 use sled::Config;
 use tracing_subscriber::fmt::format::FmtSpan;
 use uuid::Uuid;
@@ -25,15 +26,21 @@ fn sink(
         })
 }
 
-// GET /after/:sequence
+#[derive(Deserialize, Serialize)]
+struct AfterQuery {
+    limit: Option<usize>,
+}
+
+// GET /after/:sequence?limit=100
 fn after(
     event_store: EventStore,
 ) -> impl Filter<Extract = impl warp::Reply, Error = warp::Rejection> + Clone {
     warp::get()
         .and(warp::path("after"))
         .and(warp::path::param::<u64>())
-        .map(move |sequence| {
-            let events = event_store.after(sequence).unwrap();
+        .and(warp::query::<AfterQuery>())
+        .map(move |sequence, query: AfterQuery| {
+            let events = event_store.after(sequence, query.limit).unwrap();
             warp::reply::json(&events)
         })
 }
