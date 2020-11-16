@@ -136,9 +136,9 @@ impl EventStore {
 
         let limit = limit.unwrap_or(DEFAULT_LIMIT);
 
-        // After this call, sequences can't start being removed, unless they're already in the
-        // process of being removed, which is okay because they must already be finished.
-        self.sequences.start_reading();
+        // While this guard is held, sequences can't start being removed, unless they're already in
+        // the process of being removed, which is okay because they must already be finished.
+        let _guard = self.sequences.start_reading();
 
         // Fetch the events and convert them info `Event`s. N.b. we collect the events into a Vec
         // to finish reading them rather than returning an iterator here.
@@ -151,18 +151,11 @@ impl EventStore {
             .take(limit)
             .collect();
 
-        // Read any in-flight sequences that are still in-flight and find the min in-flight
-        // sequence.
-        let min_in_flight_sequence = self.sequences.min_in_flight_sequence();
-
-        // We've now read the events (and got the minimum in-flight sequence) we can allow removing
-        // sequences.
-        self.sequences.finished_reading();
-
-        if let Some(s) = min_in_flight_sequence {
+        // Find the min in-flight sequence.
+        if let Some(min_in_flight_sequence) = self.sequences.min_in_flight_sequence() {
             // If we have any in-flight sequences, we only want to retain events where the sequence
             // is earlier than the min in-flight sequence.
-            events.retain(|e| e.sequence < s);
+            events.retain(|e| e.sequence < min_in_flight_sequence);
         }
 
         Ok(events)

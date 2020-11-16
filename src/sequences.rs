@@ -51,9 +51,10 @@ impl Sequences {
             .copied()
     }
 
-    pub fn start_reading(&self) {
+    pub fn start_reading(&self) -> SequenceGuard {
         // Lock removing of in-flight sequences while we fetch events
         self.readers_count.fetch_add(1, Ordering::SeqCst);
+        SequenceGuard::new(&self)
     }
 
     fn mark_sequence_in_flight(&self, sequence: u64) {
@@ -64,7 +65,7 @@ impl Sequences {
         self.finished_sequences.write().unwrap().insert(sequence);
     }
 
-    pub fn finished_reading(&self) {
+    fn finished_reading(&self) {
         self.readers_count.fetch_sub(1, Ordering::SeqCst);
 
         // If there are no other readers we're safe to remove in-flight sequences
@@ -95,5 +96,22 @@ impl<'a> NewSequence<'a> {
 impl Drop for NewSequence<'_> {
     fn drop(&mut self) {
         self.sequences.mark_sequence_finished(self.value);
+    }
+}
+
+#[must_use]
+pub struct SequenceGuard<'a> {
+    sequences: &'a Sequences,
+}
+
+impl<'a> SequenceGuard<'a> {
+    fn new(sequences: &'a Sequences) -> Self {
+        Self { sequences }
+    }
+}
+
+impl Drop for SequenceGuard<'_> {
+    fn drop(&mut self) {
+        self.sequences.finished_reading();
     }
 }
