@@ -1,0 +1,9 @@
+[
+  {
+    "aggregate_sequence": 1,
+    "aggregate_type": "Foo",
+    "event_type": "Bar",
+    "body": {},
+    "metadata": {}
+  }
+]
