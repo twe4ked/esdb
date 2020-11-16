@@ -63,11 +63,15 @@ impl Sequences {
 
     fn mark_sequence_finished(&self, sequence: u64) {
         self.finished_sequences.write().unwrap().insert(sequence);
+        self.try_remove_finished_in_flight_sequences();
     }
 
     fn finished_reading(&self) {
         self.readers_count.fetch_sub(1, Ordering::SeqCst);
+        self.try_remove_finished_in_flight_sequences();
+    }
 
+    fn try_remove_finished_in_flight_sequences(&self) {
         // If there are no other readers we're safe to remove in-flight sequences
         if self.readers_count.load(Ordering::SeqCst) == 0 {
             // Read the finished sequences first
