@@ -135,16 +135,18 @@ impl EventStore {
         // process of being removed, which is okay because they must already be finished.
         self.sequences.start_reading();
 
-        // Fetch the events and convert them info `Event`s
-        let events = self
+        // Fetch the events and convert them info `Event`s. N.b. we collect the events into a Vec
+        // to finish reading them rather than returning an iterator here.
+        let mut events: Vec<_> = self
             .db
             .open_tree("events")?
             .range(sequence.to_be_bytes()..(sequence + 1000).to_be_bytes())
             .map(|e| e.unwrap())
-            .map(|(_, e)| -> Event { serde_json::from_slice(&e).expect("decode error") });
+            .map(|(_, e)| -> Event { serde_json::from_slice(&e).expect("decode error") })
+            .collect();
 
         // Read any in-flight sequences that are still in-flight and find the min in-flight
-        // sequence
+        // sequence.
         let min_in_flight_sequence = self.sequences.min_in_flight_sequence();
 
         // We've now read the events (and got the minimum in-flight sequence) we can allow removing
@@ -152,12 +154,12 @@ impl EventStore {
         self.sequences.finished_reading();
 
         if let Some(s) = min_in_flight_sequence {
-            // If we have any in-flight sequences, we want to filter out any events that are after
-            // the min in-flight sequence
-            Ok(events.filter(|e| e.sequence < s).collect())
-        } else {
-            Ok(events.collect())
+            // If we have any in-flight sequences, we only want to retain events where the sequence
+            // is earlier than the min in-flight sequence.
+            events.retain(|e| e.sequence < s);
         }
+
+        Ok(events)
     }
 }
 
