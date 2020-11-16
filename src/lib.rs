@@ -131,6 +131,8 @@ impl EventStore {
         // We want events _after_ this sequence.
         let sequence = sequence + 1;
 
+        // After this call, sequences can't start being removed, unless they're already in the
+        // process of being removed, which is okay because they must already be finished.
         self.sequences.start_reading();
 
         // Fetch the events and convert them info `Event`s
@@ -145,8 +147,8 @@ impl EventStore {
         // sequence
         let min_in_flight_sequence = self.sequences.min_in_flight_sequence();
 
-        // We've now read the events and any in-flight sequences so we can allow removing
-        // in-flight sequences again.
+        // We've now read the events (and got the minimum in-flight sequence) we can allow removing
+        // sequences.
         self.sequences.finished_reading();
 
         if let Some(s) = min_in_flight_sequence {
@@ -192,30 +194,8 @@ impl Sequences {
     }
 
     fn start_reading(&self) {
-        self.try_remove_finished_in_flight_sequences();
-
-        // While we have the "removing" lock we know that no other threads are removing
-        // sequences. This means we're safe to increment "readers_count"
-        // which will prevent other threads from removing in-flight sequences while we're
-        // reading.
-        //
         // Lock removing of in-flight sequences while we fetch events
         self.readers_count.fetch_add(1, Ordering::SeqCst);
-    }
-
-    fn try_remove_finished_in_flight_sequences(&self) {
-        // Read the finished sequences first
-        let finished_sequences = self.finished_sequences.read().unwrap();
-
-        // If there are no other readers we're safe to remove in-flight sequences
-        if self.readers_count.load(Ordering::SeqCst) == 0 {
-            let mut w = self.in_flight_sequences.write().unwrap();
-
-            // Remove any sequences that are no longer in flight
-            for sequence in finished_sequences.iter() {
-                w.remove(&sequence);
-            }
-        }
     }
 
     fn mark_sequence_in_flight(&self, sequence: u64) {
@@ -228,6 +208,18 @@ impl Sequences {
 
     fn finished_reading(&self) {
         self.readers_count.fetch_sub(1, Ordering::SeqCst);
+
+        // If there are no other readers we're safe to remove in-flight sequences
+        if self.readers_count.load(Ordering::SeqCst) == 0 {
+            // Read the finished sequences first
+            let mut finished_sequences = self.finished_sequences.write().unwrap();
+
+            // Remove any sequences that are no longer in flight
+            let mut in_flight_sequences = self.in_flight_sequences.write().unwrap();
+            for sequence in finished_sequences.drain() {
+                in_flight_sequences.remove(&sequence);
+            }
+        }
     }
 
     /// When generating a sequence we need to do it in a lock so that we can be sure that no other
