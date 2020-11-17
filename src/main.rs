@@ -17,11 +17,8 @@ fn sink(
         // Only accept bodies smaller than 16kb...
         .and(warp::body::content_length_limit(1024 * 16))
         .and(warp::body::json())
-        .map(move |aggregate_id, mut events: Vec<NewEvent>| {
-            // TODO: Sink multiple events.
-            event_store
-                .sink(events.pop().unwrap(), aggregate_id)
-                .unwrap();
+        .map(move |aggregate_id, events: Vec<NewEvent>| {
+            event_store.sink(events, aggregate_id).unwrap();
             Ok(StatusCode::NO_CONTENT)
         })
 }

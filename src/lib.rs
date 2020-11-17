@@ -83,39 +83,39 @@ impl EventStore {
         }
     }
 
-    // TODO: This should take a list of events and sink them as part of the same transaction.
-    // The API should be designed in a way that makes it impossible to sink events to different
-    // aggregates.
-    pub fn sink(&self, new_event: NewEvent, aggregate_id: Uuid) -> sled::Result<()> {
-        let aggregates = self.db.open_tree("aggregates")?;
-        let events = self.db.open_tree("events")?;
+    // TODO: This should all be part of a transaction.
+    pub fn sink(&self, new_events: Vec<NewEvent>, aggregate_id: Uuid) -> sled::Result<()> {
+        for new_event in new_events {
+            let aggregates = self.db.open_tree("aggregates")?;
+            let events = self.db.open_tree("events")?;
 
-        let sequence = self.sequences.generate(&self.db)?;
+            let sequence = self.sequences.generate(&self.db)?;
 
-        // KEY: aggregate_id + aggregate_sequence
-        let mut aggregates_key = aggregate_id.as_bytes().to_vec();
-        aggregates_key.extend_from_slice(&new_event.aggregate_sequence.to_be_bytes());
-        aggregates
-            // The compare_and_swap here ensure the aggregate_id + aggregate_sequence is unique so we
-            // can be sure we don't have a stale aggregate.
-            .compare_and_swap(
-                &aggregates_key,
-                None as Option<&[u8]>,
-                Some(serde_json::to_vec(&sequence.value).unwrap()),
-            )?
-            .expect("stale aggregate");
+            // KEY: aggregate_id + aggregate_sequence
+            let mut aggregates_key = aggregate_id.as_bytes().to_vec();
+            aggregates_key.extend_from_slice(&new_event.aggregate_sequence.to_be_bytes());
+            aggregates
+                // The compare_and_swap here ensure the aggregate_id + aggregate_sequence is unique so we
+                // can be sure we don't have a stale aggregate.
+                .compare_and_swap(
+                    &aggregates_key,
+                    None as Option<&[u8]>,
+                    Some(serde_json::to_vec(&sequence.value).unwrap()),
+                )?
+                .expect("stale aggregate");
 
-        let event_id = Uuid::new_v4(); // TODO: Ensure uniqueness
-        let event = Event::from_new_event(new_event, aggregate_id, sequence.value, event_id);
+            let event_id = Uuid::new_v4(); // TODO: Ensure uniqueness
+            let event = Event::from_new_event(new_event, aggregate_id, sequence.value, event_id);
 
-        // KEY: sequence
-        events.insert(
-            &sequence.value.to_be_bytes(),
-            serde_json::to_vec(&event).unwrap(),
-        )?;
+            // KEY: sequence
+            events.insert(
+                &sequence.value.to_be_bytes(),
+                serde_json::to_vec(&event).unwrap(),
+            )?;
 
-        // Flush the database after each sink.
-        self.db.flush()?;
+            // Flush the database after each sink.
+            self.db.flush()?;
+        }
 
         Ok(())
     }
