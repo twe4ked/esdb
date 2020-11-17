@@ -114,6 +114,9 @@ impl EventStore {
             serde_json::to_vec(&event).unwrap(),
         )?;
 
+        // Flush the database after each sink.
+        self.db.flush()?;
+
         Ok(())
     }
 
