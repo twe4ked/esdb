@@ -18,7 +18,10 @@ fn sink(
         .and(warp::body::content_length_limit(1024 * 16))
         .and(warp::body::json())
         .map(move |aggregate_id, events: Vec<NewEvent>| {
-            event_store.sink(events, aggregate_id).unwrap();
+            event_store
+                .sink(events, aggregate_id)
+                .unwrap()
+                .expect("stale aggregate");
             Ok(StatusCode::NO_CONTENT)
         })
 }
