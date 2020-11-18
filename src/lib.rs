@@ -1,6 +1,7 @@
 use chrono::prelude::*;
 use serde::{Deserialize, Serialize};
 use serde_json::value::Value as JsonValue;
+use sled::transaction::{abort, TransactionResult, Transactional};
 use sled::{Config, Db};
 use thiserror::Error;
 use uuid::Uuid;
@@ -90,49 +91,49 @@ impl EventStore {
         }
     }
 
-    // TODO: This should all be part of a transaction.
     pub fn sink(
         &self,
         new_events: Vec<NewEvent>,
         aggregate_id: Uuid,
-    ) -> sled::Result<Result<(), SinkError>> {
-        for new_event in new_events {
-            let aggregates = self.db.open_tree("aggregates")?;
-            let events = self.db.open_tree("events")?;
+    ) -> TransactionResult<(), SinkError> {
+        let aggregates = self.db.open_tree("aggregates")?;
+        let events = self.db.open_tree("events")?;
 
-            let sequence = self.sequences.generate(&self.db)?;
+        (&aggregates, &events).transaction(|(aggregates, events)| {
+            for new_event in new_events.clone() {
+                let sequence = self.sequences.generate(&events)?;
 
-            // KEY: aggregate_id + aggregate_sequence
-            let mut aggregates_key = aggregate_id.as_bytes().to_vec();
-            aggregates_key.extend_from_slice(&new_event.aggregate_sequence.to_be_bytes());
-            // The compare_and_swap here ensure the aggregate_id + aggregate_sequence is unique
-            // so we can be sure we don't have a stale aggregate.
-            let cas_result = aggregates.compare_and_swap(
-                &aggregates_key,
-                None as Option<&[u8]>,
-                Some(serde_json::to_vec(&sequence.value).unwrap()),
-            )?;
+                // KEY: aggregate_id + aggregate_sequence
+                let mut aggregates_key = aggregate_id.as_bytes().to_vec();
+                aggregates_key.extend_from_slice(&new_event.aggregate_sequence.to_be_bytes());
 
-            // We can't handle the stale aggregate error as the caller will need to reload the
-            // aggregate and try again.
-            if cas_result.is_err() {
-                return Ok(Err(SinkError::StaleAggregate));
+                // The aggregate_id + aggregate_sequence here needs to be unique so we can be sure
+                // we don't have a stale aggregate.
+                if aggregates.get(&aggregates_key)?.is_some() {
+                    // We can't handle the stale aggregate error as the caller will need to reload the
+                    // aggregate and try again.
+                    return abort(SinkError::StaleAggregate)?;
+                }
+                aggregates.insert(aggregates_key, serde_json::to_vec(&sequence.value).unwrap())?;
+
+                let event_id = Uuid::new_v4(); // TODO: Ensure uniqueness
+                let event =
+                    Event::from_new_event(new_event, aggregate_id, sequence.value, event_id);
+
+                // KEY: sequence
+                events.insert(
+                    &sequence.value.to_be_bytes(),
+                    serde_json::to_vec(&event).unwrap(),
+                )?;
             }
 
-            let event_id = Uuid::new_v4(); // TODO: Ensure uniqueness
-            let event = Event::from_new_event(new_event, aggregate_id, sequence.value, event_id);
+            Ok(())
+        })?;
 
-            // KEY: sequence
-            events.insert(
-                &sequence.value.to_be_bytes(),
-                serde_json::to_vec(&event).unwrap(),
-            )?;
+        // Flush the database after each sink.
+        self.db.flush()?;
 
-            // Flush the database after each sink.
-            self.db.flush()?;
-        }
-
-        Ok(Ok(()))
+        Ok(())
     }
 
     pub fn for_aggregate(&self, aggregate_id: Uuid) -> sled::Result<Vec<Event>> {
@@ -187,6 +188,8 @@ mod tests {
 
     #[test]
     fn sink_stale_aggregate() {
+        use sled::transaction::TransactionError;
+
         let event_store = EventStore::new().unwrap();
 
         let aggregate_id = Uuid::new_v4();
@@ -198,16 +201,15 @@ mod tests {
             metadata: json!({}),
         };
 
-        let sink_1_result = event_store
-            .sink(vec![event.clone()], aggregate_id.clone())
-            .unwrap();
+        let sink_1_result = event_store.sink(vec![event.clone()], aggregate_id.clone());
         assert!(sink_1_result.is_ok());
 
         // The second sink will fail because the aggregate_sequence has already been used by this
         // aggregate.
-        let sink_2_result = event_store
-            .sink(vec![event.clone()], aggregate_id.clone())
-            .unwrap();
-        assert_eq!(sink_2_result.unwrap_err(), SinkError::StaleAggregate);
+        let sink_2_result = event_store.sink(vec![event.clone()], aggregate_id.clone());
+        assert_eq!(
+            sink_2_result.unwrap_err(),
+            TransactionError::Abort(SinkError::StaleAggregate)
+        );
     }
 }

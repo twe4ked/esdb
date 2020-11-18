@@ -1,4 +1,4 @@
-use sled::Db;
+use sled::transaction::TransactionalTree;
 
 use std::collections::HashSet;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -29,10 +29,10 @@ impl Sequences {
 
     /// When generating a sequence we need to do it in a lock so that we can be sure that no other
     /// IDs get generated before we mark the new sequence as in-flight.
-    pub fn generate(&self, db: &Db) -> sled::Result<NewSequence> {
+    pub fn generate(&self, tree: &TransactionalTree) -> sled::Result<NewSequence> {
         match self.generate_sequence_lock.lock() {
             Ok(_) => {
-                let sequence = db.generate_id()?;
+                let sequence = tree.generate_id()?;
                 // Start sequence at 1.
                 let sequence = sequence + 1;
                 self.mark_sequence_in_flight(sequence);
