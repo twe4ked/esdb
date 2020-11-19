@@ -1,3 +1,4 @@
+use byteorder::BigEndian;
 use chrono::prelude::*;
 use serde::{Deserialize, Serialize};
 use serde_json::value::Value as JsonValue;
@@ -5,6 +6,7 @@ use sled::transaction::{abort, TransactionResult, Transactional};
 use sled::{Config, Db};
 use thiserror::Error;
 use uuid::Uuid;
+use zerocopy::{byteorder::U64, AsBytes, FromBytes, LayoutVerified, Unaligned};
 
 const DEFAULT_LIMIT: usize = 1000;
 
@@ -73,6 +75,22 @@ pub enum SinkError {
     StaleAggregate,
 }
 
+#[derive(FromBytes, AsBytes, Unaligned)]
+#[repr(C)]
+struct Sequence(U64<BigEndian>);
+
+impl Sequence {
+    fn new(value: u64) -> Self {
+        Self(U64::new(value))
+    }
+
+    fn from_slice(bytes: &mut [u8]) -> u64 {
+        let layout: LayoutVerified<&mut [u8], Sequence> =
+            LayoutVerified::new_unaligned(&mut *bytes).expect("bytes do not fit schema");
+        layout.into_ref().0.get()
+    }
+}
+
 impl EventStore {
     pub fn new() -> sled::Result<Self> {
         let db = Config::default().temporary(true).open()?;
@@ -94,14 +112,13 @@ impl EventStore {
 
         (&aggregates, &events, &seq).transaction(|(aggregates, events, seq)| {
             for new_event in new_events.clone() {
-                let sequence: u64 = if let Some(current_sequence) = seq.get(b"seq")? {
-                    let current_sequence: u64 =
-                        serde_json::from_slice(&current_sequence).expect("decode error");
+                let sequence: u64 = if let Some(mut current_sequence) = seq.get(b"seq")? {
+                    let current_sequence = Sequence::from_slice(&mut current_sequence);
                     let new_sequence = current_sequence + 1;
-                    seq.insert(b"seq", serde_json::to_vec(&new_sequence).unwrap())?;
+                    seq.insert(b"seq", Sequence::new(new_sequence).as_bytes())?;
                     new_sequence
                 } else {
-                    seq.insert(b"seq", serde_json::to_vec(&0).unwrap())?;
+                    seq.insert(b"seq", Sequence::new(0).as_bytes())?;
                     0
                 };
 
