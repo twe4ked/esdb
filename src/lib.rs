@@ -8,10 +8,6 @@ use uuid::Uuid;
 
 const DEFAULT_LIMIT: usize = 1000;
 
-mod sequences;
-
-use crate::sequences::Sequences;
-
 #[derive(Deserialize, Serialize, Debug, PartialEq, Clone)]
 pub struct NewEvent {
     pub aggregate_sequence: u64,
@@ -69,7 +65,6 @@ struct EventId(Uuid);
 #[derive(Clone)]
 pub struct EventStore {
     db: Db,
-    sequences: Sequences,
 }
 
 #[derive(Error, Debug, PartialEq)]
@@ -85,10 +80,7 @@ impl EventStore {
     }
 
     pub fn new_with_db(db: Db) -> Self {
-        Self {
-            db,
-            sequences: Sequences::new(),
-        }
+        Self { db }
     }
 
     pub fn sink(
@@ -98,10 +90,20 @@ impl EventStore {
     ) -> TransactionResult<(), SinkError> {
         let aggregates = self.db.open_tree("aggregates")?;
         let events = self.db.open_tree("events")?;
+        let seq = self.db.open_tree("seq")?;
 
-        (&aggregates, &events).transaction(|(aggregates, events)| {
+        (&aggregates, &events, &seq).transaction(|(aggregates, events, seq)| {
             for new_event in new_events.clone() {
-                let sequence = self.sequences.generate(&events)?;
+                let sequence: u64 = if let Some(current_sequence) = seq.get(b"seq")? {
+                    let current_sequence: u64 =
+                        serde_json::from_slice(&current_sequence).expect("decode error");
+                    let new_sequence = current_sequence + 1;
+                    seq.insert(b"seq", serde_json::to_vec(&new_sequence).unwrap())?;
+                    new_sequence
+                } else {
+                    seq.insert(b"seq", serde_json::to_vec(&0).unwrap())?;
+                    0
+                };
 
                 // KEY: aggregate_id + aggregate_sequence
                 let mut aggregates_key = aggregate_id.as_bytes().to_vec();
@@ -114,17 +116,13 @@ impl EventStore {
                     // aggregate and try again.
                     return abort(SinkError::StaleAggregate)?;
                 }
-                aggregates.insert(aggregates_key, serde_json::to_vec(&sequence.value).unwrap())?;
+                aggregates.insert(aggregates_key, serde_json::to_vec(&sequence).unwrap())?;
 
                 let event_id = Uuid::new_v4(); // TODO: Ensure uniqueness
-                let event =
-                    Event::from_new_event(new_event, aggregate_id, sequence.value, event_id);
+                let event = Event::from_new_event(new_event, aggregate_id, sequence, event_id);
 
                 // KEY: sequence
-                events.insert(
-                    &sequence.value.to_be_bytes(),
-                    serde_json::to_vec(&event).unwrap(),
-                )?;
+                events.insert(&sequence.to_be_bytes(), serde_json::to_vec(&event).unwrap())?;
             }
 
             Ok(())
@@ -155,29 +153,15 @@ impl EventStore {
 
         let limit = limit.unwrap_or(DEFAULT_LIMIT);
 
-        // While this guard is held, sequences can't start being removed, unless they're already in
-        // the process of being removed, which is okay because they must already be finished.
-        let _guard = self.sequences.start_reading();
-
-        // Fetch the events and convert them info `Event`s. N.b. we collect the events into a Vec
-        // to finish reading them rather than returning an iterator here.
-        let mut events: Vec<_> = self
+        // Fetch the events and convert them info `Event`s.
+        Ok(self
             .db
             .open_tree("events")?
             .range(sequence.to_be_bytes()..)
             .map(|e| e.unwrap())
             .map(|(_, e)| -> Event { serde_json::from_slice(&e).expect("decode error") })
             .take(limit)
-            .collect();
-
-        // Find the min in-flight sequence.
-        if let Some(min_in_flight_sequence) = self.sequences.min_in_flight_sequence() {
-            // If we have any in-flight sequences, we only want to retain events where the sequence
-            // is earlier than the min in-flight sequence.
-            events.retain(|e| e.sequence < min_in_flight_sequence);
-        }
-
-        Ok(events)
+            .collect())
     }
 }
 
