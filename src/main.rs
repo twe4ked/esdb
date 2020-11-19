@@ -73,7 +73,12 @@ async fn main() {
         .with_span_events(FmtSpan::CLOSE)
         .init();
 
-    let db = Config::default().temporary(true).open().unwrap();
+    let db = if let Ok(path) = std::env::var("DATABASE_PATH") {
+        Config::default().path(path).open()
+    } else {
+        Config::default().temporary(true).open()
+    }
+    .unwrap();
     let event_store = EventStore::new_with_db(db);
 
     warp::serve(routes(event_store).with(warp::trace::request()))
