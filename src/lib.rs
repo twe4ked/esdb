@@ -55,9 +55,6 @@ impl Event {
     }
 }
 
-#[derive(Deserialize, Serialize, Debug, PartialEq, Clone)]
-struct EventId(Uuid);
-
 #[derive(Clone)]
 pub struct EventStore {
     db: Db,
