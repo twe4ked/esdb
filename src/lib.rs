@@ -229,7 +229,7 @@ mod tests {
 
         // The second sink will fail because the aggregate_sequence has already been used by this
         // aggregate.
-        let sink_2_result = event_store.sink(vec![event.clone()], aggregate_id.clone());
+        let sink_2_result = event_store.sink(vec![event], aggregate_id.clone());
         assert_eq!(
             sink_2_result.unwrap_err(),
             TransactionError::Abort(SinkError::StaleAggregate)
