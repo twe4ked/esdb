@@ -82,7 +82,7 @@ impl Sequence {
     }
 
     fn from_slice(bytes: &mut [u8]) -> u64 {
-        let layout: LayoutVerified<&mut [u8], Sequence> =
+        let layout: LayoutVerified<&mut [u8], Self> =
             LayoutVerified::new_unaligned(&mut *bytes).expect("bytes do not fit schema");
         layout.into_ref().0.get()
     }
