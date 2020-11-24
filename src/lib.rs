@@ -15,10 +15,8 @@ const DEFAULT_LIMIT: usize = 1000;
 #[derive(Deserialize, Serialize, Debug, PartialEq, Clone)]
 pub struct NewEvent {
     pub aggregate_sequence: u64,
-    pub aggregate_type: String,
     pub event_type: String,
     pub body: JsonValue,
-    pub metadata: JsonValue,
 }
 
 #[derive(Deserialize, Serialize, Debug, PartialEq, Clone)]
@@ -27,11 +25,9 @@ pub struct Event {
     pub aggregate_sequence: u64,
     pub event_id: Uuid,
     pub aggregate_id: Uuid,
-    pub aggregate_type: String,
     pub event_type: String,
     pub created_at: DateTime<Utc>,
     pub body: JsonValue,
-    pub metadata: JsonValue,
 }
 
 impl Event {
@@ -43,10 +39,8 @@ impl Event {
     ) -> Self {
         let NewEvent {
             aggregate_sequence,
-            aggregate_type,
             event_type,
             body,
-            metadata,
         } = new_event;
 
         Event {
@@ -54,11 +48,9 @@ impl Event {
             aggregate_sequence,
             event_id,
             aggregate_id,
-            aggregate_type,
             event_type,
             created_at: Utc::now(),
             body,
-            metadata,
         }
     }
 }
@@ -228,10 +220,8 @@ mod tests {
         let aggregate_id = Uuid::new_v4();
         let event = NewEvent {
             aggregate_sequence: 1,
-            aggregate_type: String::new(),
             event_type: String::new(),
             body: json!({}),
-            metadata: json!({}),
         };
 
         let sink_1_result = event_store.sink(vec![event.clone()], aggregate_id.clone());
@@ -264,9 +254,7 @@ mod tests {
         let event = NewEvent {
             aggregate_sequence: 1,
             event_type: String::new(),
-            aggregate_type: String::new(),
             body: json!({}),
-            metadata: json!({}),
         };
 
         let sink_1_result = event_store.sink(vec![event.clone()], Uuid::new_v4());
