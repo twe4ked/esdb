@@ -8,6 +8,7 @@ use thiserror::Error;
 use uuid::Uuid;
 use zerocopy::{byteorder::U64, AsBytes, FromBytes, LayoutVerified, Unaligned};
 
+use std::convert::TryInto;
 use std::sync::Arc;
 
 const DEFAULT_LIMIT: usize = 1000;
@@ -31,20 +32,47 @@ pub struct Event {
 }
 
 impl Event {
-    fn from_new_event(
-        new_event: NewEvent,
-        aggregate_id: Uuid,
-        sequence: u64,
-        event_id: Uuid,
-    ) -> Self {
+    fn from_event_data(event_data: EventValue, sequence: u64) -> Self {
+        let EventValue {
+            aggregate_sequence,
+            event_type,
+            body,
+            event_id,
+            aggregate_id,
+            created_at,
+        } = event_data;
+
+        Self {
+            aggregate_sequence,
+            event_id,
+            sequence,
+            aggregate_id,
+            event_type,
+            created_at,
+            body,
+        }
+    }
+}
+
+#[derive(Deserialize, Serialize, Debug, PartialEq, Clone)]
+struct EventValue {
+    aggregate_sequence: u64,
+    event_id: Uuid,
+    aggregate_id: Uuid,
+    event_type: String,
+    created_at: DateTime<Utc>,
+    body: JsonValue,
+}
+
+impl EventValue {
+    fn from_new_event(new_event: NewEvent, aggregate_id: Uuid, event_id: Uuid) -> Self {
         let NewEvent {
             aggregate_sequence,
             event_type,
             body,
         } = new_event;
 
-        Event {
-            sequence,
+        Self {
             aggregate_sequence,
             event_id,
             aggregate_id,
@@ -157,7 +185,7 @@ impl EventStore {
                         event_ids.insert(event_ids_key, &[])?;
                     }
 
-                    let event = Event::from_new_event(new_event, aggregate_id, sequence, event_id);
+                    let event = EventValue::from_new_event(new_event, aggregate_id, event_id);
 
                     // KEY: sequence
                     events.insert(&sequence.to_be_bytes(), serde_json::to_vec(&event).unwrap())?;
@@ -181,8 +209,11 @@ impl EventStore {
             .scan_prefix(&aggregate_id.as_bytes())
             .filter_map(|e| e.ok())
             .map(|(_, s)| -> u64 { serde_json::from_slice(&s).expect("decode error") })
-            .map(|s| events.get(&s.to_be_bytes()).unwrap())
-            .map(|e| -> Event { serde_json::from_slice(&e.unwrap()).unwrap() })
+            .map(|s| {
+                let e = events.get(&s.to_be_bytes()).unwrap();
+                let event_data: EventValue = serde_json::from_slice(&e.unwrap()).unwrap();
+                Event::from_event_data(event_data, s)
+            })
             .collect())
     }
 
@@ -198,7 +229,12 @@ impl EventStore {
             .open_tree("events")?
             .range(sequence.to_be_bytes()..)
             .map(|e| e.unwrap())
-            .map(|(_, e)| -> Event { serde_json::from_slice(&e).expect("decode error") })
+            .map(|(s, e)| {
+                let event_data: EventValue = serde_json::from_slice(&e).unwrap();
+                let sequence: [u8; 8] = (*s).try_into().unwrap();
+                let s = u64::from_be_bytes(sequence);
+                Event::from_event_data(event_data, s)
+            })
             .take(limit)
             .collect())
     }
