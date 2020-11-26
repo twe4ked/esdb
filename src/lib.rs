@@ -129,8 +129,9 @@ impl EventStore {
                         seq.insert(b"seq", Sequence::new(new_sequence).as_bytes())?;
                         new_sequence
                     } else {
-                        seq.insert(b"seq", Sequence::new(0).as_bytes())?;
-                        0
+                        // Start sequence at 1
+                        seq.insert(b"seq", Sequence::new(1).as_bytes())?;
+                        1
                     };
 
                     // KEY: aggregate_id + aggregate_sequence
