@@ -205,38 +205,34 @@ impl EventStore {
         let events = self.db.open_tree("events")?;
         let aggregates = self.db.open_tree("aggregates")?;
 
-        Ok(aggregates
-            .scan_prefix(&aggregate_id.as_bytes())
-            .filter_map(|e| e.ok())
-            .map(|(_, s)| -> u64 { serde_json::from_slice(&s).expect("decode error") })
-            .map(|s| {
-                let e = events.get(&s.to_be_bytes()).unwrap();
-                let event_data: EventValue = serde_json::from_slice(&e.unwrap()).unwrap();
-                Event::from_event_data(event_data, s)
-            })
-            .collect())
+        itertools::process_results(aggregates.scan_prefix(&aggregate_id.as_bytes()), |iter| {
+            iter.map(|(_, s)| -> u64 { serde_json::from_slice(&s).expect("decode error") })
+                .map(|s| {
+                    let e = events.get(&s.to_be_bytes()).unwrap();
+                    let event_data: EventValue = serde_json::from_slice(&e.unwrap()).unwrap();
+                    Event::from_event_data(event_data, s)
+                })
+                .collect()
+        })
     }
 
     pub fn after(&self, sequence: u64, limit: Option<usize>) -> sled::Result<Vec<Event>> {
+        let events = self.db.open_tree("events")?;
+
         // We want events _after_ this sequence.
         let sequence = sequence + 1;
-
         let limit = limit.unwrap_or(DEFAULT_LIMIT);
 
-        // Fetch the events and convert them info `Event`s.
-        Ok(self
-            .db
-            .open_tree("events")?
-            .range(sequence.to_be_bytes()..)
-            .map(|e| e.unwrap())
-            .map(|(s, e)| {
-                let event_data: EventValue = serde_json::from_slice(&e).unwrap();
-                let sequence: [u8; 8] = (*s).try_into().unwrap();
-                let s = u64::from_be_bytes(sequence);
-                Event::from_event_data(event_data, s)
-            })
-            .take(limit)
-            .collect())
+        itertools::process_results(events.range(sequence.to_be_bytes()..), |iter| {
+            iter.take(limit)
+                .map(|(s, e)| {
+                    let event_data: EventValue = serde_json::from_slice(&e).expect("decode error");
+                    let sequence: [u8; 8] = (*s).try_into().unwrap();
+                    let s = u64::from_be_bytes(sequence);
+                    Event::from_event_data(event_data, s)
+                })
+                .collect()
+        })
     }
 }
 
