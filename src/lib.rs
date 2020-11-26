@@ -246,6 +246,40 @@ mod tests {
     use serde_json::json;
 
     #[test]
+    fn basic() {
+        let event_store = EventStore::new().unwrap();
+
+        let aggregate_id = Uuid::new_v4();
+        let event = NewEvent {
+            aggregate_sequence: 1,
+            event_type: "foo_bar".to_string(),
+            body: json!({"foo": "bar"}),
+        };
+
+        event_store.sink(vec![event], aggregate_id.clone()).unwrap();
+
+        {
+            let events = event_store.after(0, None).unwrap();
+            let event = events.first().unwrap();
+            assert_eq!(event.sequence, 1);
+            assert_eq!(event.aggregate_sequence, 1);
+            assert_eq!(event.aggregate_id, aggregate_id);
+            assert_eq!(event.event_type, "foo_bar".to_string());
+            assert_eq!(event.body, json!({"foo": "bar"}));
+        }
+
+        {
+            let events = event_store.for_aggregate(aggregate_id).unwrap();
+            let event = events.first().unwrap();
+            assert_eq!(event.sequence, 1);
+            assert_eq!(event.aggregate_sequence, 1);
+            assert_eq!(event.aggregate_id, aggregate_id);
+            assert_eq!(event.event_type, "foo_bar".to_string());
+            assert_eq!(event.body, json!({"foo": "bar"}));
+        }
+    }
+
+    #[test]
     fn sink_stale_aggregate() {
         use sled::transaction::TransactionError;
 
