@@ -173,7 +173,7 @@ impl EventStore {
                         // aggregate and try again.
                         return abort(SinkError::StaleAggregate)?;
                     }
-                    aggregates.insert(aggregates_key, serde_json::to_vec(&sequence).unwrap())?;
+                    aggregates.insert(aggregates_key, &sequence.to_be_bytes())?;
 
                     // Generate an ID and use it as a key, this way the transaction will try again
                     // if it's not unique.
@@ -206,13 +206,12 @@ impl EventStore {
         let aggregates = self.db.open_tree("aggregates")?;
 
         itertools::process_results(aggregates.scan_prefix(&aggregate_id.as_bytes()), |iter| {
-            iter.map(|(_, s)| -> u64 { serde_json::from_slice(&s).expect("decode error") })
-                .map(|s| {
-                    let e = events.get(&s.to_be_bytes()).unwrap();
-                    let event_data: EventValue = serde_json::from_slice(&e.unwrap()).unwrap();
-                    Event::from_event_data(event_data, s)
-                })
-                .collect()
+            iter.map(|(_, s)| {
+                let e = events.get(&s).unwrap();
+                let event_data: EventValue = serde_json::from_slice(&e.unwrap()).unwrap();
+                Event::from_event_data(event_data, to_u64(&s))
+            })
+            .collect()
         })
     }
 
@@ -227,13 +226,16 @@ impl EventStore {
             iter.take(limit)
                 .map(|(s, e)| {
                     let event_data: EventValue = serde_json::from_slice(&e).expect("decode error");
-                    let sequence: [u8; 8] = (*s).try_into().unwrap();
-                    let s = u64::from_be_bytes(sequence);
-                    Event::from_event_data(event_data, s)
+                    Event::from_event_data(event_data, to_u64(&s))
                 })
                 .collect()
         })
     }
+}
+
+fn to_u64(input: &[u8]) -> u64 {
+    let input: [u8; 8] = (*input).try_into().unwrap();
+    u64::from_be_bytes(input)
 }
 
 #[cfg(test)]
