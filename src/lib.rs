@@ -205,17 +205,18 @@ impl EventStore {
         let limit = limit.unwrap_or(DEFAULT_LIMIT);
 
         let iter: IndexIter<u64, PersyId> = self.persy.range("sequence", sequence..)?;
-        Ok(iter
-            .take(limit)
-            .map(|(sequence, value)| match value {
-                Value::SINGLE(id) => {
-                    let e = self.persy.read("events", &id).expect("TODO");
-                    let event_data: EventValue = serde_json::from_slice(&e.unwrap()).unwrap();
-                    Event::from_event_data(event_data, Some(sequence))
-                }
-                Value::CLUSTER(_) => unreachable!("only one event per sequence"),
+        let iter = iter.take(limit).map(|(sequence, value)| match value {
+            Value::SINGLE(id) => self.persy.read("events", &id).map(|e| (sequence, e)),
+            Value::CLUSTER(_) => unreachable!("only one event per sequence"),
+        });
+
+        itertools::process_results(iter, |iter| {
+            iter.map(|(sequence, e)| {
+                let event_data: EventValue = serde_json::from_slice(&e.unwrap()).unwrap();
+                Event::from_event_data(event_data, Some(sequence))
             })
-            .collect())
+            .collect()
+        })
     }
 }
 
