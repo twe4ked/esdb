@@ -1,14 +1,12 @@
-use byteorder::BigEndian;
 use chrono::prelude::*;
+use persy::{IndexIter, OpenOptions, PRes, Persy, PersyId, Value, ValueMode};
 use serde::{Deserialize, Serialize};
 use serde_json::value::Value as JsonValue;
-use sled::transaction::{abort, TransactionResult, Transactional};
-use sled::{Config, Db};
 use thiserror::Error;
 use uuid::Uuid;
-use zerocopy::{byteorder::U64, AsBytes, FromBytes, LayoutVerified, Unaligned};
 
-use std::convert::TryInto;
+use std::path::Path;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 
 const DEFAULT_LIMIT: usize = 1000;
@@ -22,7 +20,8 @@ pub struct NewEvent {
 
 #[derive(Deserialize, Serialize, Debug, PartialEq, Clone)]
 pub struct Event {
-    pub sequence: u64,
+    // Events only contain a sequence when they're returned from `after`
+    pub sequence: Option<u64>,
     pub aggregate_sequence: u64,
     pub event_id: Uuid,
     pub aggregate_id: Uuid,
@@ -32,7 +31,7 @@ pub struct Event {
 }
 
 impl Event {
-    fn from_event_data(event_data: EventValue, sequence: u64) -> Self {
+    fn from_event_data(event_data: EventValue, sequence: Option<u64>) -> Self {
         let EventValue {
             aggregate_sequence,
             event_type,
@@ -85,8 +84,9 @@ impl EventValue {
 
 #[derive(Clone)]
 pub struct EventStore {
-    db: Db,
+    persy: Persy,
     uuid_generator: Arc<dyn UuidGenerator>,
+    sequence: Arc<AtomicU64>,
 }
 
 #[derive(Error, Debug, PartialEq)]
@@ -95,22 +95,6 @@ pub enum SinkError {
     StaleAggregate,
     #[error("Event ID conflict")]
     EventIdConflict,
-}
-
-#[derive(FromBytes, AsBytes, Unaligned)]
-#[repr(C)]
-struct Sequence(U64<BigEndian>);
-
-impl Sequence {
-    fn new(value: u64) -> Self {
-        Self(U64::new(value))
-    }
-
-    fn from_slice(bytes: &mut [u8]) -> u64 {
-        let layout: LayoutVerified<&mut [u8], Self> =
-            LayoutVerified::new_unaligned(&mut *bytes).expect("bytes do not fit schema");
-        layout.into_ref().0.get()
-    }
 }
 
 trait UuidGenerator: Sync + Send {
@@ -125,117 +109,114 @@ impl UuidGenerator for UuidGeneratorV4 {
     }
 }
 
+fn init_db(persy: &Persy) -> PRes<()> {
+    let mut tx = persy.begin()?;
+
+    tx.create_segment("events")?;
+    tx.create_index::<u128, PersyId>("aggregate", ValueMode::CLUSTER)?;
+    tx.create_index::<String, PersyId>("aggregate_unique", ValueMode::EXCLUSIVE)?;
+    tx.create_index::<u128, PersyId>("event_id_unique", ValueMode::EXCLUSIVE)?;
+    tx.create_index::<u64, PersyId>("sequence", ValueMode::EXCLUSIVE)?;
+
+    let prepared = tx.prepare()?;
+    prepared.commit()?;
+
+    Ok(())
+}
+
 impl EventStore {
-    pub fn new() -> sled::Result<Self> {
-        let db = Config::default().temporary(true).open()?;
-        Ok(Self::new_with_db(db))
+    pub fn new_temporary() -> PRes<Self> {
+        let persy = OpenOptions::new()
+            .create(true)
+            .prepare_with(init_db)
+            .memory()?;
+        Ok(Self::new_with_persy(persy))
     }
 
-    pub fn new_with_db(db: Db) -> Self {
+    pub fn new_persisted(path: &Path) -> PRes<Self> {
+        let persy = OpenOptions::new()
+            .create(true)
+            .prepare_with(init_db)
+            .open(path)?;
+        Ok(Self::new_with_persy(persy))
+    }
+
+    fn new_with_persy(persy: Persy) -> Self {
         Self {
-            db,
+            persy,
             uuid_generator: Arc::new(UuidGeneratorV4),
+            // TODO: Find current sequence
+            sequence: Arc::new(AtomicU64::new(1)),
         }
     }
 
-    pub fn sink(
-        &self,
-        new_events: Vec<NewEvent>,
-        aggregate_id: Uuid,
-    ) -> TransactionResult<(), SinkError> {
-        let aggregates = self.db.open_tree("aggregates")?;
-        let events = self.db.open_tree("events")?;
-        let seq = self.db.open_tree("seq")?;
-        let event_ids = self.db.open_tree("event_ids")?;
+    pub fn sink(&self, new_events: Vec<NewEvent>, aggregate_id: Uuid) -> PRes<()> {
+        let mut tx = self.persy.begin()?;
 
-        (&aggregates, &events, &seq, &event_ids).transaction(
-            |(aggregates, events, seq, event_ids)| {
-                for new_event in new_events.clone() {
-                    let sequence: u64 = if let Some(mut current_sequence) = seq.get(b"seq")? {
-                        let current_sequence = Sequence::from_slice(&mut current_sequence);
-                        let new_sequence = current_sequence + 1;
-                        seq.insert(b"seq", Sequence::new(new_sequence).as_bytes())?;
-                        new_sequence
-                    } else {
-                        // Start sequence at 1
-                        seq.insert(b"seq", Sequence::new(1).as_bytes())?;
-                        1
-                    };
+        for new_event in new_events.clone() {
+            let sequence = self.sequence.fetch_add(1, Ordering::SeqCst);
 
-                    // KEY: aggregate_id + aggregate_sequence
-                    let mut aggregates_key = aggregate_id.as_bytes().to_vec();
-                    aggregates_key.extend_from_slice(&new_event.aggregate_sequence.to_be_bytes());
+            let event_id = self.uuid_generator.generate();
+            let aggregate_sequence = new_event.aggregate_sequence;
 
-                    // The aggregate_id + aggregate_sequence here needs to be unique so we can be sure
-                    // we don't have a stale aggregate.
-                    if aggregates.get(&aggregates_key)?.is_some() {
-                        // We can't handle the stale aggregate error as the caller will need to reload the
-                        // aggregate and try again.
-                        return abort(SinkError::StaleAggregate)?;
-                    }
-                    aggregates.insert(aggregates_key, &sequence.to_be_bytes())?;
+            let event = EventValue::from_new_event(new_event, aggregate_id, event_id);
+            let id = tx.insert("events", &serde_json::to_vec(&event).unwrap())?;
 
-                    // Generate an ID and use it as a key, this way the transaction will try again
-                    // if it's not unique.
-                    let event_id = self.uuid_generator.generate();
-                    let event_ids_key = event_id.as_bytes().to_vec();
-                    if event_ids.get(&event_ids_key)?.is_some() {
-                        return abort(SinkError::EventIdConflict)?;
-                    } else {
-                        event_ids.insert(event_ids_key, &[])?;
-                    }
+            let optimistic_lock = format!("{}:{}", aggregate_id, aggregate_sequence);
 
-                    let event = EventValue::from_new_event(new_event, aggregate_id, event_id);
+            // We can't handle the stale aggregate error as the caller will need to reload the
+            // aggregate and try again.
+            tx.put::<String, PersyId>("aggregate_unique", optimistic_lock, id.clone())?;
 
-                    // KEY: sequence
-                    events.insert(&sequence.to_be_bytes(), serde_json::to_vec(&event).unwrap())?;
-                }
+            // TODO: We can attempt to handle these errors internally
+            tx.put::<u128, PersyId>("event_id_unique", event_id.as_u128(), id.clone())?;
+            tx.put::<u128, PersyId>("aggregate", aggregate_id.as_u128(), id.clone())?;
+            tx.put::<u64, PersyId>("sequence", sequence, id)?;
+        }
 
-                Ok(())
-            },
-        )?;
-
-        // Flush the database after each sink.
-        self.db.flush()?;
+        let prepared = tx.prepare()?;
+        prepared.commit()?;
 
         Ok(())
     }
 
-    pub fn for_aggregate(&self, aggregate_id: Uuid) -> sled::Result<Vec<Event>> {
-        let events = self.db.open_tree("events")?;
-        let aggregates = self.db.open_tree("aggregates")?;
+    pub fn for_aggregate(&self, aggregate_id: Uuid) -> PRes<Vec<Event>> {
+        let read_id = self
+            .persy
+            .get::<u128, PersyId>("aggregate", &aggregate_id.as_u128())?;
 
-        itertools::process_results(aggregates.scan_prefix(&aggregate_id.as_bytes()), |iter| {
-            iter.map(|(_, s)| {
-                let e = events.get(&s).unwrap();
-                let event_data: EventValue = serde_json::from_slice(&e.unwrap()).unwrap();
-                Event::from_event_data(event_data, to_u64(&s))
-            })
-            .collect()
-        })
+        if let Some(value) = read_id {
+            match value {
+                Value::SINGLE(id) => {
+                    let e = self.persy.read("events", &id)?;
+                    let event_data: EventValue = serde_json::from_slice(&e.unwrap()).unwrap();
+                    Ok(vec![Event::from_event_data(event_data, None)])
+                }
+                Value::CLUSTER(_) => todo!("handle multiple events"),
+            }
+        } else {
+            Ok(Vec::new())
+        }
     }
 
-    pub fn after(&self, sequence: u64, limit: Option<usize>) -> sled::Result<Vec<Event>> {
-        let events = self.db.open_tree("events")?;
-
+    pub fn after(&self, sequence: u64, limit: Option<usize>) -> PRes<Vec<Event>> {
         // We want events _after_ this sequence.
         let sequence = sequence + 1;
         let limit = limit.unwrap_or(DEFAULT_LIMIT);
 
-        itertools::process_results(events.range(sequence.to_be_bytes()..), |iter| {
-            iter.take(limit)
-                .map(|(s, e)| {
-                    let event_data: EventValue = serde_json::from_slice(&e).expect("decode error");
-                    Event::from_event_data(event_data, to_u64(&s))
-                })
-                .collect()
-        })
+        let iter: IndexIter<u64, PersyId> = self.persy.range("sequence", sequence..)?;
+        Ok(iter
+            .take(limit)
+            .map(|(sequence, value)| match value {
+                Value::SINGLE(id) => {
+                    let e = self.persy.read("events", &id).expect("TODO");
+                    let event_data: EventValue = serde_json::from_slice(&e.unwrap()).unwrap();
+                    Event::from_event_data(event_data, Some(sequence))
+                }
+                Value::CLUSTER(_) => unreachable!("only one event per sequence"),
+            })
+            .collect())
     }
-}
-
-fn to_u64(input: &[u8]) -> u64 {
-    let input: [u8; 8] = (*input).try_into().unwrap();
-    u64::from_be_bytes(input)
 }
 
 #[cfg(test)]
@@ -245,7 +226,7 @@ mod tests {
 
     #[test]
     fn basic() {
-        let event_store = EventStore::new().unwrap();
+        let event_store = EventStore::new_temporary().unwrap();
 
         let aggregate_id = Uuid::new_v4();
         let event = NewEvent {
@@ -259,7 +240,7 @@ mod tests {
         {
             let events = event_store.after(0, None).unwrap();
             let event = events.first().unwrap();
-            assert_eq!(event.sequence, 1);
+            assert_eq!(event.sequence, Some(1));
             assert_eq!(event.aggregate_sequence, 1);
             assert_eq!(event.aggregate_id, aggregate_id);
             assert_eq!(event.event_type, "foo_bar".to_string());
@@ -269,7 +250,7 @@ mod tests {
         {
             let events = event_store.for_aggregate(aggregate_id).unwrap();
             let event = events.first().unwrap();
-            assert_eq!(event.sequence, 1);
+            assert_eq!(event.sequence, None);
             assert_eq!(event.aggregate_sequence, 1);
             assert_eq!(event.aggregate_id, aggregate_id);
             assert_eq!(event.event_type, "foo_bar".to_string());
@@ -279,9 +260,7 @@ mod tests {
 
     #[test]
     fn sink_stale_aggregate() {
-        use sled::transaction::TransactionError;
-
-        let event_store = EventStore::new().unwrap();
+        let event_store = EventStore::new_temporary().unwrap();
 
         let aggregate_id = Uuid::new_v4();
         let event = NewEvent {
@@ -296,17 +275,13 @@ mod tests {
         // The second sink will fail because the aggregate_sequence has already been used by this
         // aggregate.
         let sink_2_result = event_store.sink(vec![event], aggregate_id.clone());
-        assert_eq!(
-            sink_2_result.unwrap_err(),
-            TransactionError::Abort(SinkError::StaleAggregate)
-        );
+        // TODO: Return SinkError::StaleAggregate
+        assert!(sink_2_result.is_err());
     }
 
     #[test]
     fn sink_duplicate_event_id() {
-        use sled::transaction::TransactionError;
-
-        let mut event_store = EventStore::new().unwrap();
+        let mut event_store = EventStore::new_temporary().unwrap();
 
         // Override the event UUID generator so we can make it generate a duplicate
         struct FakeUuidGenerator;
@@ -327,9 +302,7 @@ mod tests {
         assert!(sink_1_result.is_ok());
 
         let sink_2_result = event_store.sink(vec![event], Uuid::new_v4());
-        assert_eq!(
-            sink_2_result.unwrap_err(),
-            TransactionError::Abort(SinkError::EventIdConflict)
-        );
+        // TODO: Return SinkError::EventIdConflict
+        assert!(sink_2_result.is_err());
     }
 }

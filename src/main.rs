@@ -1,11 +1,12 @@
 use serde::{Deserialize, Serialize};
-use sled::Config;
 use tracing_subscriber::fmt::format::FmtSpan;
 use uuid::Uuid;
 use warp::http::StatusCode;
 use warp::Filter;
 
 use esdb::{EventStore, NewEvent};
+
+use std::path::Path;
 
 // POST /sink/:aggregate_id
 fn sink(
@@ -73,13 +74,12 @@ async fn main() {
         .with_span_events(FmtSpan::CLOSE)
         .init();
 
-    let db = if let Ok(path) = std::env::var("DATABASE_PATH") {
-        Config::default().path(path).open()
+    let event_store = if let Ok(path) = std::env::var("DATABASE_PATH") {
+        EventStore::new_persisted(&Path::new(&path))
     } else {
-        Config::default().temporary(true).open()
+        EventStore::new_temporary()
     }
     .unwrap();
-    let event_store = EventStore::new_with_db(db);
 
     warp::serve(routes(event_store).with(warp::trace::request()))
         .run(([127, 0, 0, 1], 3030))
