@@ -51,6 +51,16 @@ impl Event {
             body,
         }
     }
+
+    fn from_slice(e: &[u8]) -> Self {
+        let event_data: EventValue = serde_json::from_slice(&e).unwrap();
+        Self::from_event_data(event_data, None)
+    }
+
+    fn from_slice_and_sequence(e: &[u8], sequence: Option<u64>) -> Self {
+        let event_data: EventValue = serde_json::from_slice(&e).unwrap();
+        Self::from_event_data(event_data, sequence)
+    }
 }
 
 #[derive(Deserialize, Serialize, Debug, PartialEq, Clone)]
@@ -189,18 +199,12 @@ impl EventStore {
             match value {
                 Value::SINGLE(id) => {
                     let e = self.persy.read("events", &id)?;
-                    let event_data: EventValue = serde_json::from_slice(&e.unwrap()).unwrap();
-                    Ok(vec![Event::from_event_data(event_data, None)])
+                    Ok(vec![Event::from_slice(&e.unwrap())])
                 }
                 Value::CLUSTER(ids) => {
                     let iter = ids.iter().map(|id| self.persy.read("events", &id));
                     itertools::process_results(iter, |iter| {
-                        iter.map(|e| {
-                            let event_data: EventValue =
-                                serde_json::from_slice(&e.unwrap()).unwrap();
-                            Event::from_event_data(event_data, None)
-                        })
-                        .collect()
+                        iter.map(|e| Event::from_slice(&e.unwrap())).collect()
                     })
                 }
             }
@@ -221,11 +225,8 @@ impl EventStore {
         });
 
         itertools::process_results(iter, |iter| {
-            iter.map(|(sequence, e)| {
-                let event_data: EventValue = serde_json::from_slice(&e.unwrap()).unwrap();
-                Event::from_event_data(event_data, Some(sequence))
-            })
-            .collect()
+            iter.map(|(sequence, e)| Event::from_slice_and_sequence(&e.unwrap(), Some(sequence)))
+                .collect()
         })
     }
 }
