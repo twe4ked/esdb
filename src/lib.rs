@@ -192,7 +192,17 @@ impl EventStore {
                     let event_data: EventValue = serde_json::from_slice(&e.unwrap()).unwrap();
                     Ok(vec![Event::from_event_data(event_data, None)])
                 }
-                Value::CLUSTER(_) => todo!("handle multiple events"),
+                Value::CLUSTER(ids) => {
+                    let iter = ids.iter().map(|id| self.persy.read("events", &id));
+                    itertools::process_results(iter, |iter| {
+                        iter.map(|e| {
+                            let event_data: EventValue =
+                                serde_json::from_slice(&e.unwrap()).unwrap();
+                            Event::from_event_data(event_data, None)
+                        })
+                        .collect()
+                    })
+                }
             }
         } else {
             Ok(Vec::new())
@@ -257,6 +267,29 @@ mod tests {
             assert_eq!(event.event_type, "foo_bar".to_string());
             assert_eq!(event.body, json!({"foo": "bar"}));
         }
+    }
+
+    #[test]
+    fn sink_multiple_events_to_aggregate() {
+        let aggregate_id = Uuid::new_v4();
+        let event_1 = NewEvent {
+            aggregate_sequence: 1,
+            event_type: String::new(),
+            body: json!({}),
+        };
+        let event_2 = NewEvent {
+            aggregate_sequence: 2,
+            event_type: String::new(),
+            body: json!({}),
+        };
+
+        let event_store = EventStore::new_temporary().unwrap();
+        event_store
+            .sink(vec![event_1, event_2], aggregate_id.clone())
+            .unwrap();
+
+        let events = event_store.for_aggregate(aggregate_id).unwrap();
+        assert_eq!(events.len(), 2);
     }
 
     #[test]
