@@ -199,12 +199,13 @@ impl EventStore {
             match value {
                 Value::SINGLE(id) => {
                     let e = self.persy.read("events", &id)?;
-                    Ok(vec![Event::from_slice(&e.unwrap())])
+                    Ok(vec![Event::from_slice(&e.expect("event exists"))])
                 }
                 Value::CLUSTER(ids) => {
                     let iter = ids.iter().map(|id| self.persy.read("events", &id));
                     itertools::process_results(iter, |iter| {
-                        iter.map(|e| Event::from_slice(&e.unwrap())).collect()
+                        iter.map(|e| Event::from_slice(&e.expect("event exists")))
+                            .collect()
                     })
                 }
             }
@@ -225,8 +226,10 @@ impl EventStore {
         });
 
         itertools::process_results(iter, |iter| {
-            iter.map(|(sequence, e)| Event::from_slice_and_sequence(&e.unwrap(), Some(sequence)))
-                .collect()
+            iter.map(|(sequence, e)| {
+                Event::from_slice_and_sequence(&e.expect("event exists"), Some(sequence))
+            })
+            .collect()
         })
     }
 }
