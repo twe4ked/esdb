@@ -134,20 +134,20 @@ fn init_db(persy: &Persy) -> PRes<()> {
     Ok(())
 }
 
+fn persy_options() -> OpenOptions {
+    let mut options = OpenOptions::new();
+    options.create(true).prepare_with(init_db);
+    options
+}
+
 impl EventStore {
     pub fn new_temporary() -> PRes<Self> {
-        let persy = OpenOptions::new()
-            .create(true)
-            .prepare_with(init_db)
-            .memory()?;
+        let persy = persy_options().memory()?;
         Ok(Self::new_with_persy(persy))
     }
 
     pub fn new_persisted(path: &Path) -> PRes<Self> {
-        let persy = OpenOptions::new()
-            .create(true)
-            .prepare_with(init_db)
-            .open(path)?;
+        let persy = persy_options().open(path)?;
         Ok(Self::new_with_persy(persy))
     }
 
