@@ -1,5 +1,5 @@
 use chrono::prelude::*;
-use persy::{IndexIter, OpenOptions, PRes, Persy, PersyId, Value, ValueMode};
+use persy::{IndexIter, OpenOptions, PRes, Persy, PersyError, PersyId, Value, ValueMode};
 use serde::{Deserialize, Serialize};
 use serde_json::value::Value as JsonValue;
 use thiserror::Error;
@@ -99,12 +99,12 @@ pub struct EventStore {
     sequence: Arc<AtomicU64>,
 }
 
-#[derive(Error, Debug, PartialEq)]
+#[derive(Error, Debug)]
 pub enum SinkError {
-    #[error("Stale aggregate")]
-    StaleAggregate,
-    #[error("Event ID conflict")]
-    EventIdConflict,
+    #[error("Stale aggregate: {0}")]
+    StaleAggregate(String),
+    #[error(transparent)]
+    StorageError(#[from] PersyError),
 }
 
 trait UuidGenerator: Sync + Send {
@@ -160,7 +160,7 @@ impl EventStore {
         }
     }
 
-    pub fn sink(&self, new_events: Vec<NewEvent>, aggregate_id: Uuid) -> PRes<()> {
+    pub fn sink(&self, new_events: Vec<NewEvent>, aggregate_id: Uuid) -> Result<(), SinkError> {
         let mut tx = self.persy.begin()?;
 
         for new_event in new_events.clone() {
@@ -184,7 +184,12 @@ impl EventStore {
             tx.put::<u64, PersyId>("sequence", sequence, id)?;
         }
 
-        let prepared = tx.prepare()?;
+        let prepared = tx.prepare().map_err(|e| match e {
+            PersyError::IndexDuplicateKey(index, value) if index == "aggregate_unique" => {
+                SinkError::StaleAggregate(value)
+            }
+            _ => e.into(),
+        })?;
         prepared.commit()?;
 
         Ok(())
@@ -313,8 +318,10 @@ mod tests {
         // The second sink will fail because the aggregate_sequence has already been used by this
         // aggregate.
         let sink_2_result = event_store.sink(vec![event], aggregate_id.clone());
-        // TODO: Return SinkError::StaleAggregate
-        assert!(sink_2_result.is_err());
+        assert_eq!(
+            format!("{}", sink_2_result.unwrap_err()),
+            format!("Stale aggregate: {}:{}", aggregate_id, 1)
+        );
     }
 
     #[test]
@@ -340,7 +347,7 @@ mod tests {
         assert!(sink_1_result.is_ok());
 
         let sink_2_result = event_store.sink(vec![event], Uuid::new_v4());
-        // TODO: Return SinkError::EventIdConflict
+        // TODO: Handle this internally
         assert!(sink_2_result.is_err());
     }
 }
