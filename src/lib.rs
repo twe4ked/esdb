@@ -173,7 +173,7 @@ impl EventStore {
         // We need to keep the in-flight sequences around until _after_ the commit.
         let mut in_flight_sequences = Vec::new();
 
-        for new_event in new_events.clone() {
+        for new_event in new_events {
             let sequence = self.sequences.generate();
 
             let event_id = self.uuid_generator.generate();
