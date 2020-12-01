@@ -122,14 +122,19 @@ impl UuidGenerator for UuidGeneratorV4 {
     }
 }
 
+const IDX_AGGREGATE_UNIQUE: &'static str = "aggregate_unique";
+const IDX_AGGREGATE: &'static str = "aggregate";
+const IDX_EVENT_ID_UNIQUE: &'static str = "event_id_unique";
+const IDX_SEQUENCE: &'static str = "sequence";
+
 fn init_db(persy: &Persy) -> PRes<()> {
     let mut tx = persy.begin()?;
 
     tx.create_segment("events")?;
-    tx.create_index::<u128, PersyId>("aggregate", ValueMode::CLUSTER)?;
-    tx.create_index::<String, PersyId>("aggregate_unique", ValueMode::EXCLUSIVE)?;
-    tx.create_index::<u128, PersyId>("event_id_unique", ValueMode::EXCLUSIVE)?;
-    tx.create_index::<u64, PersyId>("sequence", ValueMode::EXCLUSIVE)?;
+    tx.create_index::<u128, PersyId>(IDX_AGGREGATE, ValueMode::CLUSTER)?;
+    tx.create_index::<String, PersyId>(IDX_AGGREGATE_UNIQUE, ValueMode::EXCLUSIVE)?;
+    tx.create_index::<u128, PersyId>(IDX_EVENT_ID_UNIQUE, ValueMode::EXCLUSIVE)?;
+    tx.create_index::<u64, PersyId>(IDX_SEQUENCE, ValueMode::EXCLUSIVE)?;
 
     let prepared = tx.prepare()?;
     prepared.commit()?;
@@ -181,12 +186,12 @@ impl EventStore {
 
             // We can't handle the stale aggregate error as the caller will need to reload the
             // aggregate and try again.
-            tx.put("aggregate_unique", optimistic_lock, id.clone())?;
+            tx.put(IDX_AGGREGATE_UNIQUE, optimistic_lock, id.clone())?;
 
             // TODO: We can attempt to handle these errors internally
-            tx.put("event_id_unique", event_id.as_u128(), id.clone())?;
-            tx.put("aggregate", aggregate_id.as_u128(), id.clone())?;
-            tx.put("sequence", sequence.value, id)?;
+            tx.put(IDX_EVENT_ID_UNIQUE, event_id.as_u128(), id.clone())?;
+            tx.put(IDX_AGGREGATE, aggregate_id.as_u128(), id.clone())?;
+            tx.put(IDX_SEQUENCE, sequence.value, id)?;
 
             in_flight_sequences.push(sequence);
         }
