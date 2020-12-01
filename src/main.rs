@@ -51,7 +51,7 @@ fn aggregate(
         .and(warp::path("aggregate"))
         .and(warp::path::param::<Uuid>())
         .map(move |aggregate_id| {
-            let events = event_store.for_aggregate(aggregate_id).unwrap();
+            let events = event_store.aggregate(aggregate_id).unwrap();
             warp::reply::json(&events)
         })
 }

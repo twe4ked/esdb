@@ -181,7 +181,7 @@ impl EventStore {
         Ok(())
     }
 
-    pub fn for_aggregate(&self, aggregate_id: Uuid) -> PRes<Vec<Event>> {
+    pub fn aggregate(&self, aggregate_id: Uuid) -> PRes<Vec<Event>> {
         fn event_from_slice(e: &[u8]) -> Event {
             serde_json::from_slice::<EventValue>(&e).unwrap().to_event()
         }
@@ -282,7 +282,7 @@ mod tests {
         }
 
         {
-            let events = event_store.for_aggregate(aggregate_id).unwrap();
+            let events = event_store.aggregate(aggregate_id).unwrap();
             let event = events.first().unwrap();
             assert_eq!(event.sequence, None);
             assert_eq!(event.aggregate_sequence, 1);
@@ -311,7 +311,7 @@ mod tests {
             .sink(vec![event_1, event_2], aggregate_id.clone())
             .unwrap();
 
-        let events = event_store.for_aggregate(aggregate_id).unwrap();
+        let events = event_store.aggregate(aggregate_id).unwrap();
         assert_eq!(events.len(), 2);
     }
 
