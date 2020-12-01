@@ -14,13 +14,13 @@ use crate::{Event, NewEvent};
 const DEFAULT_LIMIT: usize = 1000;
 
 #[derive(Deserialize, Serialize, Debug, PartialEq, Clone)]
-pub struct EventValue {
-    pub aggregate_sequence: u64,
-    pub event_id: Uuid,
-    pub aggregate_id: Uuid,
-    pub event_type: String,
-    pub created_at: DateTime<Utc>,
-    pub body: JsonValue,
+struct EventValue {
+    aggregate_sequence: u64,
+    event_id: Uuid,
+    aggregate_id: Uuid,
+    event_type: String,
+    created_at: DateTime<Utc>,
+    body: JsonValue,
 }
 
 impl EventValue {
@@ -37,6 +37,31 @@ impl EventValue {
             aggregate_id,
             event_type,
             created_at: Utc::now(),
+            body,
+        }
+    }
+
+    pub fn to_event(self) -> Event {
+        self.to_event_with_sequence(None)
+    }
+
+    pub fn to_event_with_sequence(self, sequence: Option<u64>) -> Event {
+        let Self {
+            aggregate_sequence,
+            event_type,
+            body,
+            event_id,
+            aggregate_id,
+            created_at,
+        } = self;
+
+        Event {
+            aggregate_sequence,
+            event_id,
+            sequence,
+            aggregate_id,
+            event_type,
+            created_at,
             body,
         }
     }
@@ -157,6 +182,10 @@ impl EventStore {
     }
 
     pub fn for_aggregate(&self, aggregate_id: Uuid) -> PRes<Vec<Event>> {
+        fn event_from_slice(e: &[u8]) -> Event {
+            serde_json::from_slice::<EventValue>(&e).unwrap().to_event()
+        }
+
         let read_id = self
             .persy
             .get::<u128, PersyId>("aggregate", &aggregate_id.as_u128())?;
@@ -165,12 +194,12 @@ impl EventStore {
             match value {
                 Value::SINGLE(id) => {
                     let e = self.persy.read("events", &id)?;
-                    Ok(vec![Event::from_slice(&e.expect("event exists"))])
+                    Ok(vec![event_from_slice(&e.expect("event exists"))])
                 }
                 Value::CLUSTER(ids) => {
                     let iter = ids.iter().map(|id| self.persy.read("events", &id));
                     itertools::process_results(iter, |iter| {
-                        iter.map(|e| Event::from_slice(&e.expect("event exists")))
+                        iter.map(|e| event_from_slice(&e.expect("event exists")))
                             .collect()
                     })
                 }
@@ -181,6 +210,12 @@ impl EventStore {
     }
 
     pub fn after(&self, sequence: u64, limit: Option<usize>) -> PRes<Vec<Event>> {
+        fn event_from_slice_and_sequence(e: &[u8], sequence: Option<u64>) -> Event {
+            serde_json::from_slice::<EventValue>(&e)
+                .unwrap()
+                .to_event_with_sequence(sequence)
+        }
+
         // We want events _after_ this sequence.
         let sequence = sequence + 1;
         let limit = limit.unwrap_or(DEFAULT_LIMIT);
@@ -197,7 +232,7 @@ impl EventStore {
 
         let events: PRes<Vec<_>> = itertools::process_results(iter, |iter| {
             iter.map(|(sequence, e)| {
-                Event::from_slice_and_sequence(&e.expect("event exists"), Some(sequence))
+                event_from_slice_and_sequence(&e.expect("event exists"), Some(sequence))
             })
             .collect()
         });
