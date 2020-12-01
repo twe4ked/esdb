@@ -6,8 +6,11 @@ use thiserror::Error;
 use uuid::Uuid;
 
 use std::path::Path;
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
+
+mod sequences;
+
+use crate::sequences::Sequences;
 
 const DEFAULT_LIMIT: usize = 1000;
 
@@ -96,7 +99,7 @@ impl EventValue {
 pub struct EventStore {
     persy: Persy,
     uuid_generator: Arc<dyn UuidGenerator>,
-    sequence: Arc<AtomicU64>,
+    sequences: Sequences,
 }
 
 #[derive(Error, Debug)]
@@ -155,16 +158,18 @@ impl EventStore {
         Self {
             persy,
             uuid_generator: Arc::new(UuidGeneratorV4),
-            // TODO: Find current sequence
-            sequence: Arc::new(AtomicU64::new(1)),
+            sequences: Sequences::new(),
         }
     }
 
     pub fn sink(&self, new_events: Vec<NewEvent>, aggregate_id: Uuid) -> Result<(), SinkError> {
         let mut tx = self.persy.begin()?;
 
+        // We need to keep the in-flight sequences around until _after_ the commit.
+        let mut in_flight_sequences = Vec::new();
+
         for new_event in new_events.clone() {
-            let sequence = self.sequence.fetch_add(1, Ordering::SeqCst);
+            let sequence = self.sequences.generate();
 
             let event_id = self.uuid_generator.generate();
             let aggregate_sequence = new_event.aggregate_sequence;
@@ -181,7 +186,9 @@ impl EventStore {
             // TODO: We can attempt to handle these errors internally
             tx.put::<u128, PersyId>("event_id_unique", event_id.as_u128(), id.clone())?;
             tx.put::<u128, PersyId>("aggregate", aggregate_id.as_u128(), id.clone())?;
-            tx.put::<u64, PersyId>("sequence", sequence, id)?;
+            tx.put::<u64, PersyId>("sequence", sequence.value, id)?;
+
+            in_flight_sequences.push(sequence);
         }
 
         let prepared = tx.prepare().map_err(|e| match e {
@@ -191,6 +198,8 @@ impl EventStore {
             _ => e.into(),
         })?;
         prepared.commit()?;
+
+        // In-flight sequences can be dropped now, but they're about to go out of scope anyway.
 
         Ok(())
     }
@@ -224,17 +233,35 @@ impl EventStore {
         let sequence = sequence + 1;
         let limit = limit.unwrap_or(DEFAULT_LIMIT);
 
+        // While this guard is held, sequences can't start being removed, unless they're already in
+        // the process of being removed, which is okay because they must already be finished.
+        let _guard = self.sequences.start_reading();
+
         let iter: IndexIter<u64, PersyId> = self.persy.range("sequence", sequence..)?;
         let iter = iter.take(limit).map(|(sequence, value)| match value {
             Value::SINGLE(id) => self.persy.read("events", &id).map(|e| (sequence, e)),
             Value::CLUSTER(_) => unreachable!("only one event per sequence"),
         });
 
-        itertools::process_results(iter, |iter| {
+        let events: PRes<Vec<_>> = itertools::process_results(iter, |iter| {
             iter.map(|(sequence, e)| {
                 Event::from_slice_and_sequence(&e.expect("event exists"), Some(sequence))
             })
             .collect()
+        });
+
+        events.map(|mut events| {
+            if let Some(min_in_flight_sequence) = self.sequences.min_in_flight_sequence() {
+                // If we have any in-flight sequences, we only want to retain events where the sequence
+                // is earlier than the min in-flight sequence.
+                events.retain(|e| {
+                    e.sequence
+                        .expect("we've just constructed this Event with a sequence")
+                        < min_in_flight_sequence
+                })
+            }
+
+            events
         })
     }
 }
