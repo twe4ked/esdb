@@ -1,45 +1,15 @@
 #!/usr/bin/env ruby
 
-require "net/http"
 require "securerandom"
-require "json"
+require_relative "client"
 
-def sink_event(aggregate_id, aggregate_sequence: 1)
-  url = URI.parse("http://localhost:3030/sink/#{aggregate_id}")
-  request = Net::HTTP::Post.new(url.to_s)
-  request["Content-Type"] = "application/json"
-  request.body = [
-    {
-      aggregate_sequence: aggregate_sequence,
-      aggregate_type: "Foo",
-      event_type: "Bar",
-      body: {},
-      metadata: {}
-    }
-  ].to_json
-  response = Net::HTTP.start(url.host, url.port) { |http| http.request(request) }
-end
+sink_event(SecureRandom.uuid)
+sink_event(SecureRandom.uuid)
+pp after_events(0)
 
-def after_events(sequence)
-  url = URI.parse("http://localhost:3030/after/#{sequence}")
-  request = Net::HTTP::Get.new(url.to_s)
-  response = Net::HTTP.start(url.host, url.port) { |http| http.request(request) }
-  JSON.parse(response.body)
-end
-
-def aggregate_events(aggregate_id)
-  url = URI.parse("http://localhost:3030/aggregate/#{aggregate_id}")
-  request = Net::HTTP::Get.new(url.to_s)
-  response = Net::HTTP.start(url.host, url.port) { |http| http.request(request) }
-  JSON.parse(response.body)
-end
-
-p sink_event(SecureRandom.uuid)
-p sink_event(SecureRandom.uuid)
-p after_events(0)
+puts "-" * 80
 
 aggregate_id = SecureRandom.uuid
-p aggregate_id
-p sink_event(aggregate_id)
-p sink_event(aggregate_id, aggregate_sequence: 2)
-p aggregate_events(aggregate_id)
+sink_event(aggregate_id)
+sink_event(aggregate_id, aggregate_sequence: 2)
+pp aggregate_events(aggregate_id)
