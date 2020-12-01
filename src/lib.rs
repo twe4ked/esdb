@@ -181,12 +181,12 @@ impl EventStore {
 
             // We can't handle the stale aggregate error as the caller will need to reload the
             // aggregate and try again.
-            tx.put::<String, PersyId>("aggregate_unique", optimistic_lock, id.clone())?;
+            tx.put("aggregate_unique", optimistic_lock, id.clone())?;
 
             // TODO: We can attempt to handle these errors internally
-            tx.put::<u128, PersyId>("event_id_unique", event_id.as_u128(), id.clone())?;
-            tx.put::<u128, PersyId>("aggregate", aggregate_id.as_u128(), id.clone())?;
-            tx.put::<u64, PersyId>("sequence", sequence.value, id)?;
+            tx.put("event_id_unique", event_id.as_u128(), id.clone())?;
+            tx.put("aggregate", aggregate_id.as_u128(), id.clone())?;
+            tx.put("sequence", sequence.value, id)?;
 
             in_flight_sequences.push(sequence);
         }
