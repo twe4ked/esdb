@@ -4,8 +4,7 @@ use std::sync::{Arc, Mutex, RwLock};
 
 #[derive(Clone)]
 pub struct Sequences {
-    in_flight_sequences: Arc<RwLock<HashSet<u64>>>,
-    finished_sequences: Arc<RwLock<HashSet<u64>>>,
+    min_in_flight_sequence: Arc<AtomicU64>,
     readers_count: Arc<AtomicU64>,
     generate_sequence_lock: Arc<Mutex<()>>,
     sequence: Arc<AtomicU64>,
@@ -14,10 +13,10 @@ pub struct Sequences {
 impl Sequences {
     pub fn new() -> Self {
         Self {
-            // List of in-flight sequences
-            in_flight_sequences: Arc::new(RwLock::new(HashSet::new())),
-            // List of sequences that have been marked as "finished" ready for removal
-            finished_sequences: Arc::new(RwLock::new(HashSet::new())),
+            // Min in-flight sequence
+            min_in_flight_sequence: Arc::new(AtomicU64::new(0)),
+            //  Max finished sequence
+            finished_sequence: Arc::new(AtomicU64::new(0)),
             // Number of threads currently reading. This is used to ensure we don't remove
             // in-flight sequences while threads might be using them.
             readers_count: Arc::new(AtomicU64::new(0)),
@@ -43,12 +42,12 @@ impl Sequences {
     }
 
     pub fn min_in_flight_sequence(&self) -> Option<u64> {
-        self.in_flight_sequences
-            .read()
-            .unwrap()
-            .iter()
-            .min()
-            .copied()
+        let x = self.min_in_flight_sequence.load(Ordering::SeqCst);
+        if x == 0 {
+            None
+        } else {
+            Some(x)
+        }
     }
 
     pub fn start_reading(&self) -> SequenceGuard {
@@ -58,11 +57,22 @@ impl Sequences {
     }
 
     fn mark_sequence_in_flight(&self, sequence: u64) {
-        self.in_flight_sequences.write().unwrap().insert(sequence);
+        self.min_in_flight_sequence.set(sequence);
     }
 
     fn mark_sequence_finished(&self, sequence: u64) {
-        self.finished_sequences.write().unwrap().insert(sequence);
+        self.finished_sequence.fetch_update(
+            Ordering::SeqCst,
+            Ordering::SeqCst,
+            |current_max_sequence_finished| {
+                if sequence > current_max_sequence_finished {
+                    Some(sequence)
+                } else {
+                    None
+                }
+            },
+        );
+
         self.try_remove_finished_in_flight_sequences();
     }
 
@@ -75,13 +85,20 @@ impl Sequences {
         // If there are no other readers we're safe to remove in-flight sequences
         if self.readers_count.load(Ordering::SeqCst) == 0 {
             // Read the finished sequences first
-            let mut finished_sequences = self.finished_sequences.write().unwrap();
+            let mut finished_sequences = self.finished_sequence.fetch(Ordering::SeqCst);
 
             // Remove any sequences that are no longer in flight
-            let mut in_flight_sequences = self.in_flight_sequences.write().unwrap();
-            for sequence in finished_sequences.drain() {
-                in_flight_sequences.remove(&sequence);
-            }
+            // self.min_in_flight_sequence.fetch_update(
+            //     Ordering::SeqCst,
+            //     Ordering::SeqCst,
+            //     |current_min_in_flight_sequence| {
+            //         if current_min_in_flight_sequence == sequence {
+            //             // There are no in flight sequences
+            //             Some(0)
+            //         } else if current_min_in_flight_sequence > sequence
+            //
+            //     },
+            // );
         }
     }
 }
