@@ -11,6 +11,8 @@ use zerocopy::{byteorder::U64, AsBytes, FromBytes, LayoutVerified, Unaligned};
 use std::convert::TryInto;
 use std::sync::Arc;
 
+mod storage;
+
 const DEFAULT_LIMIT: usize = 1000;
 
 #[derive(Deserialize, Serialize, Debug, PartialEq, Clone)]
