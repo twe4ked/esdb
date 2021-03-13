@@ -30,6 +30,7 @@ const PAGE_SIZE: u64 = 256;
 enum PageRef {
     Data { index: u64, length: u64 },
     Index { index: u64, length: u64 },
+    Overflow { index: u64, length: u64 },
 }
 
 impl PageRef {
@@ -37,6 +38,7 @@ impl PageRef {
         match self {
             PageRef::Data { length, .. } => *length,
             PageRef::Index { length, .. } => *length,
+            PageRef::Overflow { length, .. } => *length,
         }
     }
 }
@@ -59,6 +61,13 @@ struct Page {
     head: u64,
     /// The length of the index
     len: u64,
+}
+
+impl Page {
+    fn free(&self) -> u64 {
+        let used = self.head - self.index;
+        self.len - used
+    }
 }
 
 #[derive(Clone)]
@@ -86,21 +95,17 @@ fn ensure_header(file: &mut File) -> io::Result<()> {
     Ok(())
 }
 
-fn file(database_path: &str) -> io::Result<File> {
+fn file() -> io::Result<File> {
     OpenOptions::new()
         .read(true)
         .write(true)
-        .open(database_path)
+        .open(DATABASE_PATH)
 }
 
 impl Storage {
-    fn file(&self) -> io::Result<File> {
-        file(DATABASE_PATH)
-    }
-
     #[allow(dead_code)]
     pub fn create_db() -> io::Result<Self> {
-        let mut file = match file(DATABASE_PATH) {
+        let mut file = match file() {
             Ok(file) => file,
             Err(_) => OpenOptions::new()
                 .read(true)
@@ -127,7 +132,7 @@ impl Storage {
 
     #[allow(dead_code)]
     fn pages(&mut self) -> io::Result<Vec<PageRef>> {
-        let file = self.file()?;
+        let file = file()?;
         let mut file = BufReader::new(file);
 
         // Start after the meta page
@@ -155,14 +160,20 @@ impl Storage {
         Ok(pages)
     }
 
+    pub fn add_page(&mut self) -> io::Result<()> {
+        Ok(())
+    }
+
     #[allow(dead_code)]
     pub fn append(&mut self, new_events: Vec<NewEvent>, aggregate_id: Uuid) -> io::Result<()> {
-        let mut file = self.file()?;
+        let mut file = file()?;
 
-        // Add a new page
-        // TODO: Check if the page is full.
         let mut current_data_page = self.current_data_page.lock().expect("poisoned");
+        // If we've never had a page
         if !current_data_page.is_some() {
+            // Add the initial page
+            // self.add_page();
+
             let index = self.next_page_index.load(Ordering::SeqCst);
             self.next_page_index.fetch_add(PAGE_SIZE, Ordering::SeqCst);
 
@@ -189,6 +200,13 @@ impl Storage {
             buffer.extend_from_slice(&buf);
         }
 
+        // Check if the page is full.
+        if buffer.len() as u64 > current_data_page.unwrap().free() {
+            // TODO: Split buffer
+            // TODO: Add overflow page the size of the remaining space required.
+            todo!();
+        }
+
         // TODO: Check aggregate_id_aggregate_sequence_unique_index
 
         file.seek(io::SeekFrom::Start(current_data_page.unwrap().head))?;
@@ -201,10 +219,9 @@ impl Storage {
         // NOTE: We have _not_ updated the data_pointer on disk (in the header) at this point, so
         // when we start the database server we will need to scan through the storage to ensure we
         // have the latest data_pointer.
-        *current_data_page = current_data_page.take().map(|mut p| {
+        if let Some(p) = current_data_page.as_mut() {
             p.head += buffer.len() as u64;
-            p
-        });
+        };
 
         for event in new_events {
             let key = format!("{}{}", aggregate_id, event.aggregate_sequence);
@@ -260,7 +277,7 @@ impl Storage {
 
     #[allow(dead_code)]
     pub fn events(&mut self) -> io::Result<Vec<NewEvent>> {
-        let file = self.file()?;
+        let file = file()?;
         let mut file = BufReader::new(file);
 
         // Start after the meta page
@@ -312,6 +329,7 @@ impl Storage {
                         events.push(event);
                     }
                 }
+                PageRef::Overflow { .. } => todo!(),
                 PageRef::Index { .. } => {
                     // Noop
                 }
@@ -325,7 +343,7 @@ impl Storage {
     fn update_indexes_on_disk(&self) -> io::Result<()> {
         // NOTE: We don't need to do this on each write, we could batch them.
 
-        let mut file = self.file()?;
+        let mut file = file()?;
 
         // Add a new page
         // TODO: Check if the page is full.
@@ -390,6 +408,12 @@ mod tests {
             body: json!({"foo": "bar"}),
         };
 
+        storage
+            .append(vec![event.clone()], aggregate_id.clone())
+            .unwrap();
+        storage
+            .append(vec![event.clone()], aggregate_id.clone())
+            .unwrap();
         storage
             .append(vec![event.clone()], aggregate_id.clone())
             .unwrap();
