@@ -152,38 +152,42 @@ impl Storage {
             buffer.extend_from_slice(&buf);
         }
 
-        // Check if the page is full.
-        if buffer.len() as u64 > current_data_page.unwrap().free() {
-            // TODO: Handle overflowing to multiple pages
-            let overflow_page = {
-                let index = self.next_page_index.fetch_add(PAGE_SIZE, Ordering::SeqCst);
-                Page::add(&mut file, index, PAGE_SIZE, b'O')?
-            };
+        // dbg!((&event_data[0..256]).hex_dump());
 
-            let mut part_1 = current_data_page.unwrap().free() as usize;
-            part_1 -= 8; // Make space for an overflow page pointer
+        let mut remaining = &buffer[..];
 
-            // Store part 1
-            file.seek(io::SeekFrom::Start(current_data_page.unwrap().head))?;
-            file.write_all(&buffer[0..part_1])?;
+        if let Some(page) = current_data_page.as_mut() {
+            // Check if we're going to overflow the current data page
+            if remaining.len() as u64 > page.free() {
+                // TODO: Handle overflowing to multiple pages
+                let mut overflow_page = {
+                    let index = self.next_page_index.fetch_add(PAGE_SIZE, Ordering::SeqCst);
+                    Page::add(&mut file, index, PAGE_SIZE, b'O')?
+                };
 
-            *current_data_page = None;
+                let mut part_1 = page.free() as usize;
+                part_1 -= 8; // Make space for an overflow page pointer
 
-            // Store page pointer
-            dbg!(&overflow_page.index.to_be_bytes());
-            dbg!(overflow_page.index);
-            file.write_all(&overflow_page.index.to_be_bytes())?;
+                // Store part 1 and a pointer to the next overflow page
+                page.write(
+                    &mut file,
+                    &[&buffer[0..part_1], &overflow_page.index.to_be_bytes()].concat(),
+                )?;
 
-            // TODO: Ensure no overflow (again)!
-            file.seek(io::SeekFrom::Start(overflow_page.head))?;
-            file.write_all(&buffer[part_1..])?;
-        } else {
-            file.seek(io::SeekFrom::Start(current_data_page.unwrap().head))?;
-            file.write_all(&buffer)?;
+                remaining = &buffer[part_1..];
 
-            if let Some(p) = current_data_page.as_mut() {
-                p.head += buffer.len() as u64;
-            };
+                // The current data page is full, so let's remove it so we add a new one next time.
+                *current_data_page = None;
+
+                if remaining.len() as u64 > overflow_page.free() {
+                    todo!("multi page overflow");
+                }
+
+                // Write the remaining
+                overflow_page.write(&mut file, &remaining)?;
+            } else {
+                page.write(&mut file, &remaining)?;
+            }
         }
 
         file.sync_data()?;
@@ -485,6 +489,52 @@ mod tests {
         assert_eq!(
             storage.events().unwrap(),
             vec![event.clone(), event.clone()]
+        );
+    }
+
+    #[test]
+    fn test_overflow_multiple_pages() {
+        let temp = tempdir();
+        let mut path = PathBuf::from(temp.path());
+        path.push("store.db");
+
+        let mut storage = Storage::create_db(path).unwrap();
+
+        let aggregate_id = Uuid::new_v4();
+        let event = NewEvent {
+            aggregate_sequence: 1,
+            event_type: String::from_utf8(vec![b'X'; (PAGE_SIZE * 2) as _]).unwrap(),
+            body: json!({"foo": "bar"}),
+        };
+
+        storage
+            .append(vec![event.clone()], aggregate_id.clone())
+            .unwrap();
+
+        storage.flush().unwrap();
+
+        assert_eq!(storage.events().unwrap(), vec![event.clone()]);
+
+        assert_eq!(
+            storage.pages().unwrap(),
+            vec![
+                PageRef::Data {
+                    index: PAGE_SIZE,
+                    length: PAGE_SIZE
+                },
+                PageRef::Overflow {
+                    index: PAGE_SIZE * 2,
+                    length: PAGE_SIZE
+                },
+                PageRef::Overflow {
+                    index: PAGE_SIZE * 3,
+                    length: PAGE_SIZE
+                },
+                PageRef::Index {
+                    index: PAGE_SIZE * 4,
+                    length: PAGE_SIZE
+                },
+            ]
         );
     }
 
