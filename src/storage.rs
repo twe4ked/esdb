@@ -8,13 +8,12 @@ use std::io::{self, BufReader, ErrorKind};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
+use pretty_hex::*;
 use uuid::Uuid;
-
-// TODO: Next thing is to actually store the current pages (data/index) and only add a new page if needed.
 
 const FILE_HEADER: &str = "esdb"; // TODO: Use a meta page instead of this header
 const DATABASE_PATH: &str = "store.db";
-const PAGE_SIZE: u64 = 256;
+const PAGE_SIZE: u64 = 4096;
 
 /// Page Header
 /// ===========
@@ -33,6 +32,22 @@ enum PageRef {
     Overflow { index: u64, length: u64 },
 }
 
+#[derive(Debug)]
+enum PageData {
+    Data(Vec<u8>),
+    Index(Vec<u8>),
+    Overflow(Vec<u8>),
+}
+
+impl PageData {
+    fn unwrap_overflow(self) -> Vec<u8> {
+        match self {
+            PageData::Overflow(data) => data,
+            _ => panic!("not an overflow page: {:?}", self),
+        }
+    }
+}
+
 impl PageRef {
     fn len(&self) -> u64 {
         match self {
@@ -47,8 +62,9 @@ fn parse_page_header(input: &[u8], index: u64) -> PageRef {
     let length = u64_from_be_bytes(&input[1..9]);
 
     match input[0] {
-        b'D' => PageRef::Data { index, length },
-        b'I' => PageRef::Index { index, length },
+        b'D' => PageRef::Data { index, length },     // 68 0x44
+        b'I' => PageRef::Index { index, length },    // 73 0x49
+        b'O' => PageRef::Overflow { index, length }, // 79 0x4f
         _ => panic!("invalid page header"),
     }
 }
@@ -67,6 +83,52 @@ impl Page {
     fn free(&self) -> u64 {
         let used = self.head - self.index;
         self.len - used
+    }
+
+    fn add(file: &mut File, index: u64, len: u64, ident: u8) -> io::Result<Self> {
+        file.seek(io::SeekFrom::Start(index))?;
+
+        file.write_all(&[ident])?; // 1
+        file.write_all(&len.to_be_bytes())?; // 8
+
+        let header_len = 1 + 8;
+
+        Ok(Self {
+            index,
+            head: index + header_len,
+            len,
+        })
+    }
+
+    fn read(file: &mut BufReader<File>, pos: u64) -> io::Result<Option<PageData>> {
+        let header_len = 9;
+        let mut header_buf = vec![0; header_len];
+
+        file.seek(io::SeekFrom::Start(pos))?;
+        match file.read_exact(&mut header_buf) {
+            Err(e) => match e.kind() {
+                ErrorKind::UnexpectedEof => return Ok(None),
+                _ => return Err(e),
+            },
+            _ => {}
+        }
+
+        let page_ref = parse_page_header(&header_buf, pos);
+        let mut buf = Vec::new();
+        // Start at the beginning again
+        file.seek(io::SeekFrom::Start(pos))?;
+        file.take(page_ref.len()).read_to_end(&mut buf)?;
+
+        // The page isn't always full, should it be?
+        // debug_assert_eq!(buf.len(), page_ref.len() as usize);
+
+        let page_data = match page_ref {
+            PageRef::Data { .. } => PageData::Data(buf),
+            PageRef::Index { .. } => PageData::Index(buf),
+            PageRef::Overflow { .. } => PageData::Overflow(buf),
+        };
+
+        Ok(Some(page_data))
     }
 }
 
@@ -160,36 +222,18 @@ impl Storage {
         Ok(pages)
     }
 
-    pub fn add_page(&mut self) -> io::Result<()> {
-        Ok(())
-    }
-
     #[allow(dead_code)]
     pub fn append(&mut self, new_events: Vec<NewEvent>, aggregate_id: Uuid) -> io::Result<()> {
         let mut file = file()?;
 
         let mut current_data_page = self.current_data_page.lock().expect("poisoned");
-        // If we've never had a page
+        // If we've never had a page, add the initial data page
         if !current_data_page.is_some() {
-            // Add the initial page
-            // self.add_page();
-
-            let index = self.next_page_index.load(Ordering::SeqCst);
-            self.next_page_index.fetch_add(PAGE_SIZE, Ordering::SeqCst);
-
-            file.seek(io::SeekFrom::Start(index))?;
-
-            file.write_all(b"D")?; // 1
-            file.write_all(&PAGE_SIZE.to_be_bytes())?; // 8
-
-            let header_len = 1 + 8;
-
-            *current_data_page = Some(Page {
-                index: index,
-                head: index + header_len,
-                len: PAGE_SIZE,
-            });
+            let index = self.next_page_index.fetch_add(PAGE_SIZE, Ordering::SeqCst);
+            *current_data_page = Some(Page::add(&mut file, index, PAGE_SIZE, b'D')?);
         }
+
+        // TODO: Check aggregate_id_aggregate_sequence_unique_index
 
         // Serialize events
         let mut buffer = Vec::new();
@@ -204,24 +248,58 @@ impl Storage {
         if buffer.len() as u64 > current_data_page.unwrap().free() {
             // TODO: Split buffer
             // TODO: Add overflow page the size of the remaining space required.
-            todo!();
+
+            let overflow_page = {
+                let index = self.next_page_index.fetch_add(PAGE_SIZE, Ordering::SeqCst);
+                let p = Page::add(&mut file, index, PAGE_SIZE, b'O')?;
+
+                // {
+                //     // TODO: This is a hack to ensure there is data after the new overflow page so
+                //     // we can read_exact in Page::read.
+                //     let index = self.next_page_index.fetch_add(PAGE_SIZE, Ordering::SeqCst);
+                //     Page::add(&mut file, index, PAGE_SIZE, b'O')?;
+                // }
+
+                p
+            };
+
+            let mut part_1 = current_data_page.unwrap().free() as usize;
+            part_1 -= 8; // Make space for an overflow page pointer
+
+            // Store part 1
+            file.seek(io::SeekFrom::Start(current_data_page.unwrap().head))?;
+            file.write_all(&buffer[0..part_1])?;
+
+            // Store page pointer
+            dbg!(&overflow_page.index.to_be_bytes());
+            dbg!(overflow_page.index);
+            file.write_all(&overflow_page.index.to_be_bytes())?;
+
+            // TODO: Ensure no overflow (again)!
+            file.seek(io::SeekFrom::Start(overflow_page.head))?;
+            file.write_all(&buffer[part_1..])?;
+
+            // file.seek(io::SeekFrom::Start(overflow_page.index))?;
+            // let mut buf = Vec::new();
+            // file.read_to_end(&mut buf)?;
+            // dbg!(buf);
+
+            // TODO: This should be a new data page
+            *current_data_page = Some(overflow_page);
+        } else {
+            file.seek(io::SeekFrom::Start(current_data_page.unwrap().head))?;
+            file.write_all(&buffer)?;
+
+            if let Some(p) = current_data_page.as_mut() {
+                p.head += buffer.len() as u64;
+            };
         }
 
-        // TODO: Check aggregate_id_aggregate_sequence_unique_index
-
-        file.seek(io::SeekFrom::Start(current_data_page.unwrap().head))?;
-        file.write_all(&buffer)?;
-
-        // TODO: Are both of these needed?
-        file.flush()?;
-        file.sync_all()?;
+        file.sync_data()?;
 
         // NOTE: We have _not_ updated the data_pointer on disk (in the header) at this point, so
         // when we start the database server we will need to scan through the storage to ensure we
         // have the latest data_pointer.
-        if let Some(p) = current_data_page.as_mut() {
-            p.head += buffer.len() as u64;
-        };
 
         for event in new_events {
             let key = format!("{}{}", aggregate_id, event.aggregate_sequence);
@@ -286,53 +364,70 @@ impl Storage {
         let mut events = Vec::new();
 
         loop {
-            let mut header_buf = vec![0; 9];
-            file.seek(io::SeekFrom::Start(pos))?;
+            match Page::read(&mut file, pos)? {
+                Some(page_data) => match page_data {
+                    PageData::Data(data) => {
+                        debug_assert_eq!(data.len(), PAGE_SIZE as usize);
 
-            match file.read_exact(&mut header_buf) {
-                Err(e) => match e.kind() {
-                    ErrorKind::UnexpectedEof => break,
-                    _ => return Err(e),
-                },
-                _ => {}
-            }
+                        // Read events from the data page
+                        let page_len = data.len();
 
-            let page_ref = parse_page_header(&header_buf, pos);
-            pos += page_ref.len();
+                        let mut i = 9; // TODO: This skips the header, make this nicer
+                        loop {
+                            if i >= page_len {
+                                break;
+                            }
 
-            match page_ref {
-                PageRef::Data { .. } => {
-                    // Read events from the data page
+                            let event_len = u16_from_be_bytes(&data[i..(i + 2)]) as usize;
+                            i += 2;
 
-                    let page_len = page_ref.len() as usize;
+                            if event_len == 0 {
+                                // There are no more events here.
+                                break;
+                            }
 
-                    let mut buf = vec![0; page_len];
-                    file.read_exact(&mut buf)?;
+                            // Check for overflow
+                            let event: NewEvent = if i + event_len >= page_len {
+                                // Read the rest of the page, minus the last 8 bytes, which contain
+                                // the overflow pointer
+                                let mut event_data = data[i..page_len - 8].to_vec();
+                                let remaining_to_read = event_len - event_data.len();
 
-                    let mut i = 0;
-                    loop {
-                        if i >= page_len {
-                            break;
-                        }
+                                // Read the index of the overflow page
+                                let overflow_page_index = u64_from_be_bytes(&data[page_len - 8..]);
+                                // Read the overflow page
+                                let overflow_page = Page::read(&mut file, overflow_page_index)?
+                                    .expect("missing overflow page")
+                                    .unwrap_overflow();
 
-                        let len = u16_from_be_bytes(&buf[i..(i + 2)]) as usize;
-                        i += 2;
+                                let mut overflow_event_data =
+                                    // Skip the header, then read the remaining data
+                                    overflow_page[9..remaining_to_read + 9].to_vec();
 
-                        if len == 0 {
-                            // There are no more events here.
-                            break;
-                        }
+                                // println!("{:?}", overflow_event_data.hex_dump());
 
-                        let event: NewEvent = serde_json::from_slice(&buf[i..(i + len)])
+                                event_data.append(&mut overflow_event_data);
+
+                                // println!("{:?}", event_data.hex_dump());
+
+                                serde_json::from_slice(&event_data)
+                            } else {
+                                serde_json::from_slice(&data[i..(i + event_len)])
+                            }
                             .expect("unable to deserialize");
-                        i += len;
-                        events.push(event);
+                            dbg!(&event);
+
+                            i += event_len;
+
+                            events.push(event);
+                        }
+
+                        pos += page_len as u64;
                     }
-                }
-                PageRef::Overflow { .. } => todo!(),
-                PageRef::Index { .. } => {
-                    // Noop
-                }
+                    PageData::Index(data) => pos += data.len() as u64,
+                    PageData::Overflow(data) => pos += data.len() as u64,
+                },
+                None => break,
             }
         }
 
@@ -349,21 +444,8 @@ impl Storage {
         // TODO: Check if the page is full.
         let mut current_index_page = self.current_index_page.lock().expect("poisoned");
         if !current_index_page.is_some() {
-            let index = self.next_page_index.load(Ordering::SeqCst);
-            self.next_page_index.fetch_add(PAGE_SIZE, Ordering::SeqCst);
-
-            file.seek(io::SeekFrom::Start(index))?;
-
-            file.write_all(b"I")?; // 1
-            file.write_all(&PAGE_SIZE.to_be_bytes())?; // 8
-
-            let header_len = 1 + 8;
-
-            *current_index_page = Some(Page {
-                index: index,
-                head: index + header_len,
-                len: PAGE_SIZE,
-            });
+            let index = self.next_page_index.fetch_add(PAGE_SIZE, Ordering::SeqCst);
+            *current_index_page = Some(Page::add(&mut file, index, PAGE_SIZE, b'I')?);
         }
 
         // TODO: Build next part of index into buffer
@@ -404,16 +486,10 @@ mod tests {
         let aggregate_id = Uuid::new_v4();
         let event = NewEvent {
             aggregate_sequence: 1,
-            event_type: "foo_bar".to_string(),
+            event_type: "foo_bar_longer".to_string(),
             body: json!({"foo": "bar"}),
         };
 
-        storage
-            .append(vec![event.clone()], aggregate_id.clone())
-            .unwrap();
-        storage
-            .append(vec![event.clone()], aggregate_id.clone())
-            .unwrap();
         storage
             .append(vec![event.clone()], aggregate_id.clone())
             .unwrap();
@@ -431,9 +507,9 @@ mod tests {
                     length: PAGE_SIZE
                 },
                 PageRef::Index {
-                    index: PAGE_SIZE + PAGE_SIZE,
+                    index: PAGE_SIZE * 2,
                     length: PAGE_SIZE
-                }
+                },
             ]
         );
 
@@ -441,15 +517,50 @@ mod tests {
             storage.events().unwrap(),
             vec![event.clone(), event.clone()]
         );
+    }
 
-        // XXX: Try writing events over a page
+    #[test]
+    fn test_overflow() {
+        let mut storage = Storage::create_db().unwrap();
+
+        let aggregate_id = Uuid::new_v4();
+        let event = NewEvent {
+            aggregate_sequence: 1,
+            event_type: String::from_utf8(vec![b'X'; PAGE_SIZE as _]).unwrap(),
+            body: json!({"foo": "bar"}),
+        };
+
+        storage
+            .append(vec![event.clone()], aggregate_id.clone())
+            .unwrap();
+
+        storage.flush().unwrap();
+
+        assert_eq!(
+            storage.pages().unwrap(),
+            vec![
+                PageRef::Data {
+                    index: PAGE_SIZE,
+                    length: PAGE_SIZE
+                },
+                PageRef::Overflow {
+                    index: PAGE_SIZE * 2,
+                    length: PAGE_SIZE
+                },
+                PageRef::Index {
+                    index: PAGE_SIZE * 3,
+                    length: PAGE_SIZE
+                },
+            ]
+        );
+
+        assert_eq!(storage.events().unwrap(), vec![event]);
     }
 
     #[test]
     fn test_parse_page_header() {
         let mut input = b"I".to_vec();
         input.append(&mut 123_u64.to_be_bytes().to_vec());
-        input.push(b'\0');
 
         assert_eq!(
             parse_page_header(&input, 42),
@@ -461,7 +572,6 @@ mod tests {
 
         let mut input = b"D".to_vec();
         input.append(&mut 123_u64.to_be_bytes().to_vec());
-        input.push(b'\0');
 
         assert_eq!(
             parse_page_header(&input, 42),
