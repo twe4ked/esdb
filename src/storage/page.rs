@@ -101,12 +101,11 @@ impl Page {
         let mut header_buf = vec![0; PAGE_HEADER_LEN as usize];
 
         file.seek(io::SeekFrom::Start(pos))?;
-        match file.read_exact(&mut header_buf) {
-            Err(e) => match e.kind() {
+        if let Err(e) = file.read_exact(&mut header_buf) {
+            match e.kind() {
                 ErrorKind::UnexpectedEof => return Ok(None),
                 _ => return Err(e),
-            },
-            _ => {}
+            }
         }
 
         let page_ref = PageRef::parse_from_header(&header_buf, pos);
