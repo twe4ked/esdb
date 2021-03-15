@@ -254,69 +254,66 @@ impl Storage {
 
         let mut events = Vec::new();
 
-        loop {
-            match Page::read(&mut file, pos)? {
-                Some(page_data) => match page_data {
-                    PageData::Data(data) => {
-                        debug_assert_eq!(data.len(), PAGE_SIZE as usize);
+        while let Some(page_data) = Page::read(&mut file, pos)? {
+            match page_data {
+                PageData::Data(data) => {
+                    debug_assert_eq!(data.len(), PAGE_SIZE as usize);
 
-                        // Read events from the data page
-                        let page_len = data.len();
-                        let page_header_len = PAGE_HEADER_LEN as usize;
+                    // Read events from the data page
+                    let page_len = data.len();
+                    let page_header_len = PAGE_HEADER_LEN as usize;
 
-                        let mut i = page_header_len; // TODO: This skips the header, make this nicer
-                        loop {
-                            if i >= page_len {
-                                break;
-                            }
-
-                            let event_len = u16_from_be_bytes(&data[i..(i + 2)]) as usize;
-                            i += 2;
-
-                            if event_len == 0 {
-                                // There are no more events here.
-                                break;
-                            }
-
-                            // Check for overflow
-                            let event: NewEvent = if i + event_len >= page_len {
-                                // Read the rest of the page, minus the last 8 bytes, which contain
-                                // the overflow pointer
-                                let mut event_data = data[i..page_len - 8].to_vec();
-                                let remaining_to_read = event_len - event_data.len();
-
-                                // Read the index of the overflow page
-                                let overflow_page_index = u64_from_be_bytes(&data[page_len - 8..]);
-                                // Read the overflow page
-                                let overflow_page = Page::read(&mut file, overflow_page_index)?
-                                    .expect("missing overflow page")
-                                    .unwrap_overflow();
-
-                                let mut overflow_event_data =
-                                    // Skip the header, then read the remaining data
-                                    overflow_page[page_header_len..remaining_to_read + page_header_len].to_vec();
-
-                                event_data.append(&mut overflow_event_data);
-
-                                dbg!((&event_data[0..256]).hex_dump());
-
-                                serde_json::from_slice(&event_data)
-                            } else {
-                                serde_json::from_slice(&data[i..(i + event_len)])
-                            }
-                            .expect("unable to deserialize");
-
-                            i += event_len;
-
-                            events.push(event);
+                    let mut i = page_header_len; // TODO: This skips the header, make this nicer
+                    loop {
+                        if i >= page_len {
+                            break;
                         }
 
-                        pos += page_len as u64;
+                        let event_len = u16_from_be_bytes(&data[i..(i + 2)]) as usize;
+                        i += 2;
+
+                        if event_len == 0 {
+                            // There are no more events here.
+                            break;
+                        }
+
+                        // Check for overflow
+                        let event: NewEvent = if i + event_len >= page_len {
+                            // Read the rest of the page, minus the last 8 bytes, which contain
+                            // the overflow pointer
+                            let mut event_data = data[i..page_len - 8].to_vec();
+                            let remaining_to_read = event_len - event_data.len();
+
+                            // Read the index of the overflow page
+                            let overflow_page_index = u64_from_be_bytes(&data[page_len - 8..]);
+                            // Read the overflow page
+                            let overflow_page = Page::read(&mut file, overflow_page_index)?
+                                .expect("missing overflow page")
+                                .unwrap_overflow();
+
+                            let mut overflow_event_data =
+                                // Skip the header, then read the remaining data
+                                overflow_page[page_header_len..remaining_to_read + page_header_len].to_vec();
+
+                            event_data.append(&mut overflow_event_data);
+
+                            dbg!((&event_data[0..256]).hex_dump());
+
+                            serde_json::from_slice(&event_data)
+                        } else {
+                            serde_json::from_slice(&data[i..(i + event_len)])
+                        }
+                        .expect("unable to deserialize");
+
+                        i += event_len;
+
+                        events.push(event);
                     }
-                    PageData::Index(data) => pos += data.len() as u64,
-                    PageData::Overflow(data) => pos += data.len() as u64,
-                },
-                None => break,
+
+                    pos += page_len as u64;
+                }
+                PageData::Index(data) => pos += data.len() as u64,
+                PageData::Overflow(data) => pos += data.len() as u64,
             }
         }
 
