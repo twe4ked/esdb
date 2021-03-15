@@ -12,135 +12,32 @@ use std::sync::{Arc, Mutex};
 use pretty_hex::*;
 use uuid::Uuid;
 
+mod page;
+
+use page::*;
+
 const FILE_HEADER: &str = "esdb"; // TODO: Use a meta page instead of this header
-const PAGE_SIZE: u64 = 4096;
 const PAGE_HEADER_LEN: u64 = 9;
 
-/// |======================================|
-/// | Page Header                          |
-/// |======================================|
-/// | D len (BE) | Data page     | 68 0x44 |
-/// |------------|---------------|---------|
-/// | I len (BE) | Index page    | 73 0x49 |
-/// |------------|---------------|---------|
-/// | O len (BE) | Overflow page | 79 0x4f |
-/// |--------------------------------------|
-///
-/// https://en.wikipedia.org/wiki/Type-length-value
-#[derive(Debug, PartialEq)]
-enum PageRef {
-    Data { index: u64, length: u64 },
-    Index { index: u64, length: u64 },
-    Overflow { index: u64, length: u64 },
-}
-
-#[derive(Debug)]
-enum PageData {
-    Data(Vec<u8>),
-    Index(Vec<u8>),
-    Overflow(Vec<u8>),
-}
-
-impl PageData {
-    fn unwrap_overflow(self) -> Vec<u8> {
-        match self {
-            PageData::Overflow(data) => data,
-            _ => panic!("not an overflow page: {:?}", self),
-        }
-    }
-
-    // fn data(&self) -> &[u8] {
-    //     match self {
-    //         PageData::Data(data) => &data[PAGE_HEADER_LEN..],
-    //         PageData::Index(data) => &data[PAGE_HEADER_LEN..],
-    //         PageData::Overflow(data) => &data[PAGE_HEADER_LEN..],
-    //     }
-    // }
-}
-
-impl PageRef {
-    fn len(&self) -> u64 {
-        match self {
-            PageRef::Data { length, .. } => *length,
-            PageRef::Index { length, .. } => *length,
-            PageRef::Overflow { length, .. } => *length,
-        }
-    }
-}
-
-fn parse_page_header(input: &[u8], index: u64) -> PageRef {
-    let length = u64_from_be_bytes(&input[1..PAGE_HEADER_LEN as usize]);
-
-    match input[0] {
-        b'D' => PageRef::Data { index, length },     // 68 0x44
-        b'I' => PageRef::Index { index, length },    // 73 0x49
-        b'O' => PageRef::Overflow { index, length }, // 79 0x4f
-        _ => panic!("invalid page header"),
-    }
-}
-
-#[derive(Copy, Clone)]
-struct Page {
-    /// Where in the file the page lives
-    index: u64,
-    /// Where we're writing to
-    head: u64,
-    /// The length of the index
-    len: u64,
-}
-
-impl Page {
-    fn free(&self) -> u64 {
-        let used = self.head - self.index;
-        self.len - used
-    }
-
-    fn add(file: &mut File, index: u64, len: u64, ident: u8) -> io::Result<Self> {
-        file.seek(io::SeekFrom::Start(index))?;
-
-        file.write_all(&[ident])?; // 1
-        file.write_all(&len.to_be_bytes())?; // 8
-
-        debug_assert_eq!(1 + 8, PAGE_HEADER_LEN);
-
-        Ok(Self {
-            index,
-            head: index + PAGE_HEADER_LEN,
-            len,
-        })
-    }
-
-    fn read(file: &mut BufReader<File>, pos: u64) -> io::Result<Option<PageData>> {
-        let mut header_buf = vec![0; PAGE_HEADER_LEN as usize];
-
-        file.seek(io::SeekFrom::Start(pos))?;
-        match file.read_exact(&mut header_buf) {
-            Err(e) => match e.kind() {
-                ErrorKind::UnexpectedEof => return Ok(None),
-                _ => return Err(e),
-            },
-            _ => {}
-        }
-
-        let page_ref = parse_page_header(&header_buf, pos);
-        let mut buf = Vec::new();
-
-        // Start at the beginning again so that we include the header in the page
-        file.seek(io::SeekFrom::Start(pos))?;
-        file.take(page_ref.len()).read_to_end(&mut buf)?;
-
-        // The page isn't always full, should it be?
-        // debug_assert_eq!(buf.len(), page_ref.len() as usize);
-
-        let page_data = match page_ref {
-            PageRef::Data { .. } => PageData::Data(buf),
-            PageRef::Index { .. } => PageData::Index(buf),
-            PageRef::Overflow { .. } => PageData::Overflow(buf),
-        };
-
-        Ok(Some(page_data))
-    }
-}
+// NOTES
+// =====
+//
+// Pages
+// -----
+//
+// Open questions:
+// - Can overflow pages be used to store multiple "overflows"? If so, how are they layed out?
+// - Should we CRC the pages? (https://github.com/zowens/crc32c)
+// - How should we "point" to the pages?
+//
+// Meta Page
+// ---------
+//
+// Open questions:
+// - Should we have one?
+//
+// Ref:
+// - https://fadden.com/tech/file-formats.html
 
 #[derive(Clone)]
 pub struct Storage {
@@ -201,10 +98,13 @@ impl Storage {
         Ok(db)
     }
 
+    fn file(&self) -> io::Result<File> {
+        file(&self.path)
+    }
+
     #[allow(dead_code)]
     fn pages(&mut self) -> io::Result<Vec<PageRef>> {
-        let file = file(&self.path)?;
-        let mut file = BufReader::new(file);
+        let mut file = BufReader::new(self.file()?);
 
         // Start after the meta page
         let mut pos = PAGE_SIZE; // TODO: Read this from the meta page
@@ -233,7 +133,7 @@ impl Storage {
 
     #[allow(dead_code)]
     pub fn append(&mut self, new_events: Vec<NewEvent>, aggregate_id: Uuid) -> io::Result<()> {
-        let mut file = file(&self.path)?;
+        let mut file = self.file()?;
 
         let mut current_data_page = self.current_data_page.lock().expect("poisoned");
         // If we don't have a current data page, add a new one
@@ -347,8 +247,7 @@ impl Storage {
 
     #[allow(dead_code)]
     pub fn events(&mut self) -> io::Result<Vec<NewEvent>> {
-        let file = file(&self.path)?;
-        let mut file = BufReader::new(file);
+        let mut file = BufReader::new(self.file()?);
 
         // Start after the meta page
         let mut pos = PAGE_SIZE; // TODO: Read this from the meta page
@@ -428,7 +327,7 @@ impl Storage {
     fn update_indexes_on_disk(&self) -> io::Result<()> {
         // NOTE: We don't need to do this on each write, we could batch them.
 
-        let mut file = file(&self.path)?;
+        let mut file = self.file()?;
 
         // Add a new page
         // TODO: Check if the page is full.
@@ -511,6 +410,8 @@ mod tests {
             storage.events().unwrap(),
             vec![event.clone(), event.clone()]
         );
+
+        temp.into_path();
     }
 
     #[test]
@@ -590,31 +491,6 @@ mod tests {
         assert_eq!(
             storage.events().unwrap(),
             vec![event.clone(), event.clone()]
-        );
-    }
-
-    #[test]
-    fn test_parse_page_header() {
-        let mut input = b"I".to_vec();
-        input.append(&mut 123_u64.to_be_bytes().to_vec());
-
-        assert_eq!(
-            parse_page_header(&input, 42),
-            PageRef::Index {
-                index: 42,
-                length: 123
-            }
-        );
-
-        let mut input = b"D".to_vec();
-        input.append(&mut 123_u64.to_be_bytes().to_vec());
-
-        assert_eq!(
-            parse_page_header(&input, 42),
-            PageRef::Data {
-                index: 42,
-                length: 123
-            }
         );
     }
 
