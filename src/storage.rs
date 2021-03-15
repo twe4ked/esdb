@@ -410,8 +410,6 @@ mod tests {
             storage.events().unwrap(),
             vec![event.clone(), event.clone()]
         );
-
-        temp.into_path();
     }
 
     #[test]
