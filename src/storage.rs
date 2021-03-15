@@ -14,15 +14,17 @@ use uuid::Uuid;
 
 const FILE_HEADER: &str = "esdb"; // TODO: Use a meta page instead of this header
 const PAGE_SIZE: u64 = 4096;
+const PAGE_HEADER_LEN: u64 = 9;
 
-/// Page Header
-/// ===========
-///
-/// |-------------------------|
-/// | D len (BE) | Data page  |
-/// |------------|------------|
-/// | I len (BE) | Index page |
-/// |-------------------------|
+/// |======================================|
+/// | Page Header                          |
+/// |======================================|
+/// | D len (BE) | Data page     | 68 0x44 |
+/// |------------|---------------|---------|
+/// | I len (BE) | Index page    | 73 0x49 |
+/// |------------|---------------|---------|
+/// | O len (BE) | Overflow page | 79 0x4f |
+/// |--------------------------------------|
 ///
 /// https://en.wikipedia.org/wiki/Type-length-value
 #[derive(Debug, PartialEq)]
@@ -46,6 +48,14 @@ impl PageData {
             _ => panic!("not an overflow page: {:?}", self),
         }
     }
+
+    // fn data(&self) -> &[u8] {
+    //     match self {
+    //         PageData::Data(data) => &data[PAGE_HEADER_LEN..],
+    //         PageData::Index(data) => &data[PAGE_HEADER_LEN..],
+    //         PageData::Overflow(data) => &data[PAGE_HEADER_LEN..],
+    //     }
+    // }
 }
 
 impl PageRef {
@@ -59,7 +69,7 @@ impl PageRef {
 }
 
 fn parse_page_header(input: &[u8], index: u64) -> PageRef {
-    let length = u64_from_be_bytes(&input[1..9]);
+    let length = u64_from_be_bytes(&input[1..PAGE_HEADER_LEN as usize]);
 
     match input[0] {
         b'D' => PageRef::Data { index, length },     // 68 0x44
@@ -91,18 +101,17 @@ impl Page {
         file.write_all(&[ident])?; // 1
         file.write_all(&len.to_be_bytes())?; // 8
 
-        let header_len = 1 + 8;
+        debug_assert_eq!(1 + 8, PAGE_HEADER_LEN);
 
         Ok(Self {
             index,
-            head: index + header_len,
+            head: index + PAGE_HEADER_LEN,
             len,
         })
     }
 
     fn read(file: &mut BufReader<File>, pos: u64) -> io::Result<Option<PageData>> {
-        let header_len = 9;
-        let mut header_buf = vec![0; header_len];
+        let mut header_buf = vec![0; PAGE_HEADER_LEN as usize];
 
         file.seek(io::SeekFrom::Start(pos))?;
         match file.read_exact(&mut header_buf) {
@@ -115,7 +124,8 @@ impl Page {
 
         let page_ref = parse_page_header(&header_buf, pos);
         let mut buf = Vec::new();
-        // Start at the beginning again
+
+        // Start at the beginning again so that we include the header in the page
         file.seek(io::SeekFrom::Start(pos))?;
         file.take(page_ref.len()).read_to_end(&mut buf)?;
 
@@ -202,7 +212,7 @@ impl Storage {
         let mut pages = Vec::new();
 
         loop {
-            let mut header_buf = vec![0; 9];
+            let mut header_buf = vec![0; PAGE_HEADER_LEN as usize];
             file.seek(io::SeekFrom::Start(pos))?;
 
             match file.read_exact(&mut header_buf) {
@@ -226,7 +236,7 @@ impl Storage {
         let mut file = file(&self.path)?;
 
         let mut current_data_page = self.current_data_page.lock().expect("poisoned");
-        // If we've never had a page, add the initial data page
+        // If we don't have a current data page, add a new one
         if !current_data_page.is_some() {
             let index = self.next_page_index.fetch_add(PAGE_SIZE, Ordering::SeqCst);
             *current_data_page = Some(Page::add(&mut file, index, PAGE_SIZE, b'D')?);
@@ -245,21 +255,10 @@ impl Storage {
 
         // Check if the page is full.
         if buffer.len() as u64 > current_data_page.unwrap().free() {
-            // TODO: Split buffer
-            // TODO: Add overflow page the size of the remaining space required.
-
+            // TODO: Handle overflowing to multiple pages
             let overflow_page = {
                 let index = self.next_page_index.fetch_add(PAGE_SIZE, Ordering::SeqCst);
-                let p = Page::add(&mut file, index, PAGE_SIZE, b'O')?;
-
-                // {
-                //     // TODO: This is a hack to ensure there is data after the new overflow page so
-                //     // we can read_exact in Page::read.
-                //     let index = self.next_page_index.fetch_add(PAGE_SIZE, Ordering::SeqCst);
-                //     Page::add(&mut file, index, PAGE_SIZE, b'O')?;
-                // }
-
-                p
+                Page::add(&mut file, index, PAGE_SIZE, b'O')?
             };
 
             let mut part_1 = current_data_page.unwrap().free() as usize;
@@ -269,6 +268,8 @@ impl Storage {
             file.seek(io::SeekFrom::Start(current_data_page.unwrap().head))?;
             file.write_all(&buffer[0..part_1])?;
 
+            *current_data_page = None;
+
             // Store page pointer
             dbg!(&overflow_page.index.to_be_bytes());
             dbg!(overflow_page.index);
@@ -277,16 +278,6 @@ impl Storage {
             // TODO: Ensure no overflow (again)!
             file.seek(io::SeekFrom::Start(overflow_page.head))?;
             file.write_all(&buffer[part_1..])?;
-
-            // file.seek(io::SeekFrom::Start(overflow_page.index))?;
-            // let mut buf = Vec::new();
-            // file.read_to_end(&mut buf)?;
-            // dbg!(buf);
-
-            {
-                let index = self.next_page_index.fetch_add(PAGE_SIZE, Ordering::SeqCst);
-                *current_data_page = Some(Page::add(&mut file, index, PAGE_SIZE, b'D')?);
-            }
         } else {
             file.seek(io::SeekFrom::Start(current_data_page.unwrap().head))?;
             file.write_all(&buffer)?;
@@ -372,8 +363,9 @@ impl Storage {
 
                         // Read events from the data page
                         let page_len = data.len();
+                        let page_header_len = PAGE_HEADER_LEN as usize;
 
-                        let mut i = 9; // TODO: This skips the header, make this nicer
+                        let mut i = page_header_len; // TODO: This skips the header, make this nicer
                         loop {
                             if i >= page_len {
                                 break;
@@ -403,20 +395,17 @@ impl Storage {
 
                                 let mut overflow_event_data =
                                     // Skip the header, then read the remaining data
-                                    overflow_page[9..remaining_to_read + 9].to_vec();
-
-                                // println!("{:?}", overflow_event_data.hex_dump());
+                                    overflow_page[page_header_len..remaining_to_read + page_header_len].to_vec();
 
                                 event_data.append(&mut overflow_event_data);
 
-                                // println!("{:?}", event_data.hex_dump());
+                                dbg!((&event_data[0..256]).hex_dump());
 
                                 serde_json::from_slice(&event_data)
                             } else {
                                 serde_json::from_slice(&data[i..(i + event_len)])
                             }
                             .expect("unable to deserialize");
-                            dbg!(&event);
 
                             i += event_len;
 
@@ -556,18 +545,52 @@ mod tests {
                     index: PAGE_SIZE * 2,
                     length: PAGE_SIZE
                 },
-                PageRef::Data {
-                    index: PAGE_SIZE * 3,
-                    length: PAGE_SIZE
-                },
                 PageRef::Index {
-                    index: PAGE_SIZE * 4,
+                    index: PAGE_SIZE * 3,
                     length: PAGE_SIZE
                 },
             ]
         );
 
-        assert_eq!(storage.events().unwrap(), vec![event]);
+        assert_eq!(storage.events().unwrap(), vec![event.clone()]);
+
+        // Add another large event
+        storage
+            .append(vec![event.clone()], aggregate_id.clone())
+            .unwrap();
+
+        storage.flush().unwrap();
+
+        assert_eq!(
+            storage.pages().unwrap(),
+            vec![
+                PageRef::Data {
+                    index: PAGE_SIZE,
+                    length: PAGE_SIZE
+                },
+                PageRef::Overflow {
+                    index: PAGE_SIZE * 2,
+                    length: PAGE_SIZE
+                },
+                PageRef::Index {
+                    index: PAGE_SIZE * 3,
+                    length: PAGE_SIZE
+                },
+                PageRef::Data {
+                    index: PAGE_SIZE * 4,
+                    length: PAGE_SIZE
+                },
+                PageRef::Overflow {
+                    index: PAGE_SIZE * 5,
+                    length: PAGE_SIZE
+                },
+            ]
+        );
+
+        assert_eq!(
+            storage.events().unwrap(),
+            vec![event.clone(), event.clone()]
+        );
     }
 
     #[test]
