@@ -5,6 +5,7 @@ use std::convert::{TryFrom, TryInto};
 use std::fs::{File, OpenOptions};
 use std::io::prelude::*;
 use std::io::{self, BufReader, ErrorKind};
+use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
@@ -12,7 +13,6 @@ use pretty_hex::*;
 use uuid::Uuid;
 
 const FILE_HEADER: &str = "esdb"; // TODO: Use a meta page instead of this header
-const DATABASE_PATH: &str = "store.db";
 const PAGE_SIZE: u64 = 4096;
 
 /// Page Header
@@ -134,6 +134,7 @@ impl Page {
 
 #[derive(Clone)]
 pub struct Storage {
+    path: PathBuf,
     next_page_index: Arc<AtomicU64>,
     current_data_page: Arc<Mutex<Option<Page>>>,
     current_index_page: Arc<Mutex<Option<Page>>>,
@@ -157,29 +158,27 @@ fn ensure_header(file: &mut File) -> io::Result<()> {
     Ok(())
 }
 
-fn file() -> io::Result<File> {
-    OpenOptions::new()
-        .read(true)
-        .write(true)
-        .open(DATABASE_PATH)
+fn file(path: &PathBuf) -> io::Result<File> {
+    OpenOptions::new().read(true).write(true).open(path)
 }
 
 impl Storage {
     #[allow(dead_code)]
-    pub fn create_db() -> io::Result<Self> {
-        let mut file = match file() {
+    pub fn create_db(path: PathBuf) -> io::Result<Self> {
+        let mut file = match file(&path) {
             Ok(file) => file,
             Err(_) => OpenOptions::new()
                 .read(true)
                 .write(true)
                 .create_new(true)
-                .open(DATABASE_PATH)?,
+                .open(&path)?,
         };
 
         ensure_header(&mut file)?;
 
         // TODO: Load these values from the header
         let db = Self {
+            path,
             next_page_index: Arc::new(AtomicU64::new(PAGE_SIZE)),
             current_data_page: Arc::new(Mutex::new(None)),
             current_index_page: Arc::new(Mutex::new(None)),
@@ -194,7 +193,7 @@ impl Storage {
 
     #[allow(dead_code)]
     fn pages(&mut self) -> io::Result<Vec<PageRef>> {
-        let file = file()?;
+        let file = file(&self.path)?;
         let mut file = BufReader::new(file);
 
         // Start after the meta page
@@ -224,7 +223,7 @@ impl Storage {
 
     #[allow(dead_code)]
     pub fn append(&mut self, new_events: Vec<NewEvent>, aggregate_id: Uuid) -> io::Result<()> {
-        let mut file = file()?;
+        let mut file = file(&self.path)?;
 
         let mut current_data_page = self.current_data_page.lock().expect("poisoned");
         // If we've never had a page, add the initial data page
@@ -284,8 +283,10 @@ impl Storage {
             // file.read_to_end(&mut buf)?;
             // dbg!(buf);
 
-            // TODO: This should be a new data page
-            *current_data_page = Some(overflow_page);
+            {
+                let index = self.next_page_index.fetch_add(PAGE_SIZE, Ordering::SeqCst);
+                *current_data_page = Some(Page::add(&mut file, index, PAGE_SIZE, b'D')?);
+            }
         } else {
             file.seek(io::SeekFrom::Start(current_data_page.unwrap().head))?;
             file.write_all(&buffer)?;
@@ -355,7 +356,7 @@ impl Storage {
 
     #[allow(dead_code)]
     pub fn events(&mut self) -> io::Result<Vec<NewEvent>> {
-        let file = file()?;
+        let file = file(&self.path)?;
         let mut file = BufReader::new(file);
 
         // Start after the meta page
@@ -438,7 +439,7 @@ impl Storage {
     fn update_indexes_on_disk(&self) -> io::Result<()> {
         // NOTE: We don't need to do this on each write, we could batch them.
 
-        let mut file = file()?;
+        let mut file = file(&self.path)?;
 
         // Add a new page
         // TODO: Check if the page is full.
@@ -481,7 +482,11 @@ mod tests {
 
     #[test]
     fn basic() {
-        let mut storage = Storage::create_db().unwrap();
+        let temp = tempdir();
+        let mut path = PathBuf::from(temp.path());
+        path.push("store.db");
+
+        let mut storage = Storage::create_db(path).unwrap();
 
         let aggregate_id = Uuid::new_v4();
         let event = NewEvent {
@@ -521,7 +526,11 @@ mod tests {
 
     #[test]
     fn test_overflow() {
-        let mut storage = Storage::create_db().unwrap();
+        let temp = tempdir();
+        let mut path = PathBuf::from(temp.path());
+        path.push("store.db");
+
+        let mut storage = Storage::create_db(path).unwrap();
 
         let aggregate_id = Uuid::new_v4();
         let event = NewEvent {
@@ -547,8 +556,12 @@ mod tests {
                     index: PAGE_SIZE * 2,
                     length: PAGE_SIZE
                 },
-                PageRef::Index {
+                PageRef::Data {
                     index: PAGE_SIZE * 3,
+                    length: PAGE_SIZE
+                },
+                PageRef::Index {
+                    index: PAGE_SIZE * 4,
                     length: PAGE_SIZE
                 },
             ]
@@ -580,5 +593,13 @@ mod tests {
                 length: 123
             }
         );
+    }
+
+    fn tempdir() -> tempfile::TempDir {
+        tempfile::Builder::new()
+            .prefix("esdb.")
+            .rand_bytes(8)
+            .tempdir()
+            .expect("unable to create tempdir")
     }
 }
