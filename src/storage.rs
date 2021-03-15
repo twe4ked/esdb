@@ -123,7 +123,7 @@ impl Storage {
                 _ => {}
             }
 
-            let page = parse_page_header(&header_buf, pos);
+            let page = PageRef::parse_from_header(&header_buf, pos);
             pos += page.len();
             pages.push(page);
         }

@@ -25,6 +25,30 @@ pub enum PageRef {
     Overflow { index: u64, length: u64 },
 }
 
+impl PageRef {
+    pub fn len(&self) -> u64 {
+        match self {
+            PageRef::Data { length, .. } => *length,
+            PageRef::Index { length, .. } => *length,
+            PageRef::Overflow { length, .. } => *length,
+        }
+    }
+
+    pub fn parse_from_header(input: &[u8], index: u64) -> PageRef {
+        let len = PAGE_HEADER_LEN as usize;
+        debug_assert_eq!(input.len(), len);
+
+        let length = u64_from_be_bytes(&input[1..len]);
+
+        match input[0] {
+            b'D' => PageRef::Data { index, length },     // 68 0x44
+            b'I' => PageRef::Index { index, length },    // 73 0x49
+            b'O' => PageRef::Overflow { index, length }, // 79 0x4f
+            _ => panic!("invalid page header"),
+        }
+    }
+}
+
 #[derive(Debug)]
 pub enum PageData {
     Data(Vec<u8>),
@@ -38,35 +62,6 @@ impl PageData {
             PageData::Overflow(data) => data,
             _ => panic!("not an overflow page: {:?}", self),
         }
-    }
-
-    // fn data(&self) -> &[u8] {
-    //     match self {
-    //         PageData::Data(data) => &data[PAGE_HEADER_LEN..],
-    //         PageData::Index(data) => &data[PAGE_HEADER_LEN..],
-    //         PageData::Overflow(data) => &data[PAGE_HEADER_LEN..],
-    //     }
-    // }
-}
-
-impl PageRef {
-    pub fn len(&self) -> u64 {
-        match self {
-            PageRef::Data { length, .. } => *length,
-            PageRef::Index { length, .. } => *length,
-            PageRef::Overflow { length, .. } => *length,
-        }
-    }
-}
-
-pub fn parse_page_header(input: &[u8], index: u64) -> PageRef {
-    let length = u64_from_be_bytes(&input[1..PAGE_HEADER_LEN as usize]);
-
-    match input[0] {
-        b'D' => PageRef::Data { index, length },     // 68 0x44
-        b'I' => PageRef::Index { index, length },    // 73 0x49
-        b'O' => PageRef::Overflow { index, length }, // 79 0x4f
-        _ => panic!("invalid page header"),
     }
 }
 
@@ -114,7 +109,7 @@ impl Page {
             _ => {}
         }
 
-        let page_ref = parse_page_header(&header_buf, pos);
+        let page_ref = PageRef::parse_from_header(&header_buf, pos);
         let mut buf = Vec::new();
 
         // Start at the beginning again so that we include the header in the page
@@ -141,7 +136,7 @@ mod tests {
         input.append(&mut 123_u64.to_be_bytes().to_vec());
 
         assert_eq!(
-            parse_page_header(&input, 42),
+            PageRef::parse_from_header(&input, 42),
             PageRef::Index {
                 index: 42,
                 length: 123
@@ -152,7 +147,7 @@ mod tests {
         input.append(&mut 123_u64.to_be_bytes().to_vec());
 
         assert_eq!(
-            parse_page_header(&input, 42),
+            PageRef::parse_from_header(&input, 42),
             PageRef::Data {
                 index: 42,
                 length: 123
