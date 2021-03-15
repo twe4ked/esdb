@@ -125,10 +125,10 @@ impl Page {
     }
 
     pub fn write(&mut self, file: &mut File, buffer: &[u8]) -> io::Result<()> {
-        // assert!(
-        //     buffer.len() as u64 > self.free(),
-        //     "buffer to large for page"
-        // );
+        debug_assert!(
+            buffer.len() as u64 <= self.free(),
+            "buffer to large for page"
+        );
 
         file.seek(io::SeekFrom::Start(self.head))?;
         file.write_all(&buffer)?;

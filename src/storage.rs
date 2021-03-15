@@ -165,26 +165,34 @@ impl Storage {
                     Page::add(&mut file, index, PAGE_SIZE, b'O')?
                 };
 
-                let mut part_1 = page.free() as usize;
-                part_1 -= 8; // Make space for an overflow page pointer
+                let mut start = 0;
+
+                let mut end = page.free() as usize;
+                end -= 8; // Make space for an overflow page pointer
 
                 // Store part 1 and a pointer to the next overflow page
                 page.write(
                     &mut file,
-                    &[&buffer[0..part_1], &overflow_page.index.to_be_bytes()].concat(),
+                    &[&buffer[start..end], &overflow_page.index.to_be_bytes()].concat(),
                 )?;
 
-                remaining = &buffer[part_1..];
+                start = end;
 
-                // The current data page is full, so let's remove it so we add a new one next time.
-                *current_data_page = None;
+                // remaining = &buffer[until..];
+                //
+                // let end = remaining.len();
+                //
+                // if end > overflow_page.free() as usize {
+                //     todo!("multi page overflow");
+                // }
 
-                if remaining.len() as u64 > overflow_page.free() {
-                    todo!("multi page overflow");
-                }
+                remaining = &buffer[start..];
 
                 // Write the remaining
                 overflow_page.write(&mut file, &remaining)?;
+
+                // The current data page is full, so let's remove it so we add a new one next time.
+                *current_data_page = None;
             } else {
                 page.write(&mut file, &remaining)?;
             }
