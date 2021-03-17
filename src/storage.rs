@@ -1,5 +1,3 @@
-use crate::NewEvent;
-
 use std::collections::BTreeSet;
 use std::convert::{TryFrom, TryInto};
 use std::fs::{File, OpenOptions};
@@ -9,8 +7,6 @@ use std::mem;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
-
-use uuid::Uuid;
 
 #[allow(unused_imports)]
 use pretty_hex::*;
@@ -133,7 +129,7 @@ impl Storage {
     }
 
     #[allow(dead_code)]
-    pub fn append(&mut self, new_events: Vec<NewEvent>, aggregate_id: Uuid) -> io::Result<()> {
+    pub fn append(&mut self, new_events: Vec<Vec<u8>>) -> io::Result<()> {
         let mut file = self.file()?;
 
         let mut current_data_page = self.current_data_page.lock().expect("poisoned");
@@ -148,10 +144,9 @@ impl Storage {
         // Serialize events
         let mut buffer = Vec::new();
         for event in new_events.iter() {
-            let buf = serde_json::to_vec(&event).expect("unable to serialize");
-            let len = u16::try_from(buf.len()).expect("event size too large");
+            let len = u16::try_from(event.len()).expect("event size too large");
             buffer.extend_from_slice(&len.to_be_bytes());
-            buffer.extend_from_slice(&buf);
+            buffer.extend_from_slice(&event);
         }
 
         let mut remaining = &buffer[..];
@@ -184,11 +179,11 @@ impl Storage {
         // when we start the database server we will need to scan through the storage to ensure we
         // have the latest data_pointer.
 
-        for event in new_events {
-            let key = format!("{}{}", aggregate_id, event.aggregate_sequence);
-            self.aggregate_id_aggregate_sequence_unique_index
-                .insert(key);
-        }
+        // for event in new_events {
+        //     let key = format!("{}{}", aggregate_id, event.aggregate_sequence);
+        //     self.aggregate_id_aggregate_sequence_unique_index
+        //         .insert(key);
+        // }
 
         // TODO: Kick off background task to update the indexes + header on the disk.
         let c = self.clone();
@@ -237,7 +232,7 @@ impl Storage {
     }
 
     #[allow(dead_code)]
-    pub fn events(&mut self) -> io::Result<Vec<NewEvent>> {
+    pub fn events(&mut self) -> io::Result<Vec<Vec<u8>>> {
         let mut file = BufReader::new(self.file()?);
 
         // Start after the meta page
@@ -274,9 +269,9 @@ impl Storage {
                         }
 
                         // Check for overflow
-                        let event: NewEvent = if event_len < (page_len - i) {
+                        let event = if event_len < (page_len - i) {
                             // We're not overflowing
-                            serde_json::from_slice(&data[i..(i + event_len)])
+                            data[i..(i + event_len)].to_vec()
                         } else {
                             // We are overflowing
 
@@ -314,9 +309,8 @@ impl Storage {
                                 remaining_to_read = event_len - event_data.len();
                             }
 
-                            serde_json::from_slice(&event_data)
-                        }
-                        .expect("unable to deserialize");
+                            event_data
+                        };
 
                         i += event_len;
 
@@ -380,7 +374,6 @@ fn hex_dump(data: &[u8]) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use serde_json::json;
 
     #[test]
     fn basic() {
@@ -390,19 +383,8 @@ mod tests {
 
         let mut storage = Storage::create_db(path).unwrap();
 
-        let aggregate_id = Uuid::new_v4();
-        let event = NewEvent {
-            aggregate_sequence: 1,
-            event_type: "foo_bar_longer".to_string(),
-            body: json!({"foo": "bar"}),
-        };
-
-        storage
-            .append(vec![event.clone()], aggregate_id.clone())
-            .unwrap();
-        storage
-            .append(vec![event.clone()], aggregate_id.clone())
-            .unwrap();
+        storage.append(vec![b"foo".to_vec()]).unwrap();
+        storage.append(vec![b"bar".to_vec()]).unwrap();
 
         storage.flush().unwrap();
 
@@ -424,7 +406,7 @@ mod tests {
 
         assert_eq!(
             storage.events().unwrap(),
-            vec![event.clone(), event.clone()]
+            vec![b"foo".to_vec(), b"bar".to_vec()]
         );
     }
 
@@ -436,19 +418,13 @@ mod tests {
 
         let mut storage = Storage::create_db(path).unwrap();
 
-        let aggregate_id = Uuid::new_v4();
-        let event = NewEvent {
-            aggregate_sequence: 1,
-            event_type: String::from_utf8(vec![b'X'; PAGE_SIZE as _]).unwrap(),
-            body: json!({"foo": "bar"}),
-        };
+        // Page size overflows because the header takes up room
+        let overflow_len = PAGE_SIZE as usize;
 
-        storage
-            .append(vec![event.clone()], aggregate_id.clone())
-            .unwrap();
-
+        storage.append(vec![vec![b'X'; overflow_len]]).unwrap();
         storage.flush().unwrap();
 
+        assert_eq!(storage.events().unwrap(), vec![vec![b'X'; overflow_len]]);
         assert_eq!(
             storage.pages().unwrap(),
             vec![
@@ -460,7 +436,7 @@ mod tests {
                 PageRef::Data {
                     index: PAGE_SIZE * 2,
                     length: PAGE_SIZE,
-                    offset: 88, // XXX: This is an overflow page
+                    offset: 27,
                 },
                 PageRef::Index {
                     index: PAGE_SIZE * 3,
@@ -470,15 +446,14 @@ mod tests {
             ]
         );
 
-        assert_eq!(storage.events().unwrap(), vec![event.clone()]);
-
-        // Add another large event
-        storage
-            .append(vec![event.clone()], aggregate_id.clone())
-            .unwrap();
-
+        // Add another large blob
+        storage.append(vec![vec![b'Y'; overflow_len]]).unwrap();
         storage.flush().unwrap();
 
+        assert_eq!(
+            storage.events().unwrap(),
+            vec![vec![b'X'; overflow_len], vec![b'Y'; overflow_len]]
+        );
         assert_eq!(
             storage.pages().unwrap(),
             vec![
@@ -490,7 +465,7 @@ mod tests {
                 PageRef::Data {
                     index: PAGE_SIZE * 2,
                     length: PAGE_SIZE,
-                    offset: 88,
+                    offset: 27,
                 },
                 PageRef::Index {
                     index: PAGE_SIZE * 3,
@@ -500,14 +475,9 @@ mod tests {
                 PageRef::Data {
                     index: PAGE_SIZE * 4,
                     length: PAGE_SIZE,
-                    offset: 176,
+                    offset: 54,
                 },
             ]
-        );
-
-        assert_eq!(
-            storage.events().unwrap(),
-            vec![event.clone(), event.clone()]
         );
     }
 
@@ -519,21 +489,13 @@ mod tests {
 
         let mut storage = Storage::create_db(path).unwrap();
 
-        let aggregate_id = Uuid::new_v4();
-        let event = NewEvent {
-            aggregate_sequence: 1,
-            event_type: String::from_utf8(vec![b'X'; (PAGE_SIZE * 2) as _]).unwrap(),
-            body: json!({"foo": "bar"}),
-        };
+        // Page size overflows because the header takes up room
+        let overflow_len = PAGE_SIZE as usize * 2;
 
-        storage
-            .append(vec![event.clone()], aggregate_id.clone())
-            .unwrap();
-
+        storage.append(vec![vec![b'X'; overflow_len]]).unwrap();
         storage.flush().unwrap();
 
-        assert_eq!(storage.events().unwrap(), vec![event.clone()]);
-
+        assert_eq!(storage.events().unwrap(), vec![vec![b'X'; overflow_len]]);
         assert_eq!(
             storage.pages().unwrap(),
             vec![
@@ -545,12 +507,12 @@ mod tests {
                 PageRef::Data {
                     index: PAGE_SIZE * 2,
                     length: PAGE_SIZE,
-                    offset: 4184,
+                    offset: 4123,
                 },
                 PageRef::Data {
                     index: PAGE_SIZE * 3,
                     length: PAGE_SIZE,
-                    offset: 113,
+                    offset: 52,
                 },
                 PageRef::Index {
                     index: PAGE_SIZE * 4,
