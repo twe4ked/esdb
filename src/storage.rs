@@ -235,6 +235,7 @@ impl Storage {
         let _index = match index_name {
             "aggregate_id_aggregate_sequence_unique_index" => {}
             "event_id_unique_index" => {}
+            "sequence_unique_index" => {}
             _ => panic!("invalid index name"),
         };
 

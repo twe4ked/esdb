@@ -71,6 +71,8 @@ pub enum SinkError {
     StaleAggregate,
     #[error("Event ID conflict")]
     EventIdConflict,
+    #[error("Sequence conflict")]
+    SequenceConflict,
     #[error("Storage error")]
     StorageError(#[from] io::Error),
 }
@@ -107,11 +109,17 @@ impl EventStore {
         for new_event in new_events {
             let event_id = self.uuid_generator.generate();
 
+            // Ensure event_id is unique
             self.storage
                 .reserve_key_in_index("event_id_unique_index", event_id.to_string())
                 .map_err(|_| SinkError::EventIdConflict)?;
 
             let sequence = self.sequence.fetch_add(1, Ordering::SeqCst);
+
+            // Ensure sequence is unique
+            self.storage
+                .reserve_key_in_index("sequence_unique_index", sequence.to_string())
+                .map_err(|_| SinkError::SequenceConflict)?;
 
             // Check aggregate_id + aggregate_sequence
             let key = format!("{}{}", aggregate_id, new_event.aggregate_sequence);
