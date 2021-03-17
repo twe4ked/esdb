@@ -1,21 +1,21 @@
-use crate::storage::u64_from_be_bytes;
+use crate::storage::{hex_dump, u64_from_be_bytes};
 
 use std::fs::File;
 use std::io::prelude::*;
 use std::io::{self, BufReader, ErrorKind};
 
-use pretty_hex::*;
-
 pub const PAGE_SIZE: u64 = 4096;
 pub const PAGE_HEADER_LEN: u64 = 17;
 
-/// |======================================|
-/// | Page Header                          |
-/// |======================================|
-/// | D len (BE) | Data page     | 68 0x44 |
-/// |------------|---------------|---------|
-/// | I len (BE) | Index page    | 73 0x49 |
-/// |------------|---------------|---------|
+/// |====================================================|
+/// | Page Header                                        |
+/// |====================================================|
+/// | D         | len (BE) | offset (BE) | Data page     |
+/// | 0x44 (68) | u64      | u64         |               |
+/// |-----------|----------|-------------|---------------|
+/// | I         | len (BE) | offset (BE) | Index page    |
+/// | 0x49 (73) |          |             |               |
+/// |-----------|----------|-------------|---------------|
 ///
 /// https://en.wikipedia.org/wiki/Type-length-value
 #[derive(Debug, PartialEq)]
@@ -41,8 +41,7 @@ impl PageRef {
     }
 
     pub fn parse_from_header(input: &[u8], index: u64) -> PageRef {
-        let len = PAGE_HEADER_LEN as usize;
-        debug_assert_eq!(input.len(), len);
+        debug_assert_eq!(input.len(), PAGE_HEADER_LEN as usize);
 
         let length = u64_from_be_bytes(&input[1..9]);
         let offset = u64_from_be_bytes(&input[9..17]);
@@ -59,7 +58,7 @@ impl PageRef {
                 offset,
             }, // 73 0x49
             _ => {
-                dbg!((&input).hex_dump());
+                hex_dump(&input);
                 panic!("invalid page header")
             }
         }

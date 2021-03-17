@@ -154,23 +154,16 @@ impl Storage {
             buffer.extend_from_slice(&buf);
         }
 
-        // dbg!((&event_data[0..256]).hex_dump());
-
         let mut remaining = &buffer[..];
 
         if let Some(page) = current_data_page.as_mut() {
             while remaining.len() as u64 > page.free() {
-                // dbg!(remaining.len());
-                // dbg!(page.free());
-
                 let mut end = page.free() as usize;
                 end -= mem::size_of::<u64>(); // Make space for an overflow page pointer
 
                 let data = &remaining[0..end];
 
-                // dbg!(&remaining[0..10]);
                 remaining = &remaining[end..];
-                // dbg!(&remaining[0..10]);
 
                 let overflow_index = self.next_page_index.fetch_add(PAGE_SIZE, Ordering::SeqCst);
                 page.write(&mut file, &[data, &overflow_index.to_be_bytes()].concat())?;
