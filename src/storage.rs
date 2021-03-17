@@ -5,6 +5,7 @@ use std::convert::{TryFrom, TryInto};
 use std::fs::{File, OpenOptions};
 use std::io::prelude::*;
 use std::io::{self, BufReader, ErrorKind};
+use std::mem;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
@@ -157,44 +158,31 @@ impl Storage {
         let mut remaining = &buffer[..];
 
         if let Some(page) = current_data_page.as_mut() {
-            // Check if we're going to overflow the current data page
-            if remaining.len() as u64 > page.free() {
-                // TODO: Handle overflowing to multiple pages
-                let mut overflow_page = {
-                    let index = self.next_page_index.fetch_add(PAGE_SIZE, Ordering::SeqCst);
-                    Page::add(&mut file, index, PAGE_SIZE, b'O')?
-                };
+            // let mut page = page;
+            let mut overflowed = false;
 
-                let mut start = 0;
+            while remaining.len() as u64 > page.free() {
+                overflowed = true;
+                // dbg!(remaining.len());
+                // dbg!(page.free());
 
                 let mut end = page.free() as usize;
-                end -= 8; // Make space for an overflow page pointer
+                end -= mem::size_of::<u64>(); // Make space for an overflow page pointer
 
-                // Store part 1 and a pointer to the next overflow page
-                page.write(
-                    &mut file,
-                    &[&buffer[start..end], &overflow_page.index.to_be_bytes()].concat(),
-                )?;
+                let data = &remaining[0..end];
 
-                start = end;
+                // dbg!(&remaining[0..10]);
+                remaining = &remaining[end..];
+                // dbg!(&remaining[0..10]);
 
-                // remaining = &buffer[until..];
-                //
-                // let end = remaining.len();
-                //
-                // if end > overflow_page.free() as usize {
-                //     todo!("multi page overflow");
-                // }
+                let overflow_index = self.next_page_index.fetch_add(PAGE_SIZE, Ordering::SeqCst);
+                page.write(&mut file, &[data, &overflow_index.to_be_bytes()].concat())?;
+                *page = Page::add(&mut file, overflow_index, PAGE_SIZE, b'O')?;
+            }
 
-                remaining = &buffer[start..];
-
-                // Write the remaining
-                overflow_page.write(&mut file, &remaining)?;
-
-                // The current data page is full, so let's remove it so we add a new one next time.
+            page.write(&mut file, &remaining)?;
+            if overflowed {
                 *current_data_page = None;
-            } else {
-                page.write(&mut file, &remaining)?;
             }
         }
 
@@ -280,6 +268,7 @@ impl Storage {
                             break;
                         }
 
+                        // The first two bytes should contain the length of the event
                         let event_len = u16_from_be_bytes(&data[i..(i + 2)]) as usize;
                         i += 2;
 
@@ -288,33 +277,37 @@ impl Storage {
                             break;
                         }
 
+                        let event: NewEvent;
+                        let event_data = Vec::new();
+
                         // Check for overflow
-                        let event: NewEvent = if i + event_len >= page_len {
+                        if i + event_len >= page_len {
                             // Read the rest of the page, minus the last 8 bytes, which contain
                             // the overflow pointer
-                            let mut event_data = data[i..page_len - 8].to_vec();
+                            event_data = data[i..page_len - 8].to_vec();
                             let remaining_to_read = event_len - event_data.len();
 
                             // Read the index of the overflow page
                             let overflow_page_index = u64_from_be_bytes(&data[page_len - 8..]);
                             // Read the overflow page
-                            let overflow_page = Page::read(&mut file, overflow_page_index)?
+                            let overflow_data = Page::read(&mut file, overflow_page_index)?
                                 .expect("missing overflow page")
                                 .unwrap_overflow();
 
                             let mut overflow_event_data =
                                 // Skip the header, then read the remaining data
-                                overflow_page[page_header_len..remaining_to_read + page_header_len].to_vec();
+                                overflow_data[page_header_len..remaining_to_read + page_header_len].to_vec();
 
                             event_data.append(&mut overflow_event_data);
 
                             dbg!((&event_data[0..256]).hex_dump());
 
-                            serde_json::from_slice(&event_data)
+                            event =
+                                serde_json::from_slice(&event_data).expect("unable to deserialize");
                         } else {
-                            serde_json::from_slice(&data[i..(i + event_len)])
+                            event = serde_json::from_slice(&data[i..(i + event_len)])
+                                .expect("unable to deserialize");
                         }
-                        .expect("unable to deserialize");
 
                         i += event_len;
 
