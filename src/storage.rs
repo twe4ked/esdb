@@ -43,7 +43,7 @@ pub struct Storage {
     next_page_index: Arc<AtomicU64>,
     current_data_page: Arc<Mutex<Option<Page>>>,
     current_index_page: Arc<Mutex<Option<Page>>>,
-    aggregate_id_aggregate_sequence_unique_index: BTreeSet<String>,
+    aggregate_id_aggregate_sequence_unique_index: Arc<Mutex<BTreeSet<String>>>,
 }
 
 fn ensure_header(file: &mut File) -> io::Result<()> {
@@ -87,7 +87,7 @@ impl Storage {
             next_page_index: Arc::new(AtomicU64::new(PAGE_SIZE)),
             current_data_page: Arc::new(Mutex::new(None)),
             current_index_page: Arc::new(Mutex::new(None)),
-            aggregate_id_aggregate_sequence_unique_index: BTreeSet::new(),
+            aggregate_id_aggregate_sequence_unique_index: Arc::new(Mutex::new(BTreeSet::new())),
         };
 
         // TODO: We should do this in case we crashed before last time.
@@ -229,6 +229,27 @@ impl Storage {
         // TODO: Update sequence?
 
         Ok(())
+    }
+
+    pub fn reserve_key_in_index(&self, index_name: &str, key: String) -> Result<(), ()> {
+        let _index = match index_name {
+            "aggregate_id_aggregate_sequence_unique_index" => {}
+            "event_id_unique_index" => {}
+            _ => panic!("invalid index name"),
+        };
+
+        // TODO: Actually use different indexes
+        let mut index = self
+            .aggregate_id_aggregate_sequence_unique_index
+            .lock()
+            .expect("poisoned");
+
+        // If the set did not have this value present, true is returned
+        if index.insert(key) {
+            Ok(())
+        } else {
+            Err(())
+        }
     }
 
     #[allow(dead_code)]

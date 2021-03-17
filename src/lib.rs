@@ -1,14 +1,12 @@
-use byteorder::BigEndian;
 use chrono::prelude::*;
 use serde::{Deserialize, Serialize};
 use serde_json::value::Value as JsonValue;
 use thiserror::Error;
 use uuid::Uuid;
-use zerocopy::{byteorder::U64, AsBytes, FromBytes, LayoutVerified, Unaligned};
 
-use std::convert::TryInto;
 use std::io;
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 
 mod storage;
@@ -36,40 +34,12 @@ pub struct Event {
 }
 
 impl Event {
-    fn from_event_data(event_data: EventValue, sequence: u64) -> Self {
-        let EventValue {
-            aggregate_sequence,
-            event_type,
-            body,
-            event_id,
-            aggregate_id,
-            created_at,
-        } = event_data;
-
-        Self {
-            aggregate_sequence,
-            event_id,
-            sequence,
-            aggregate_id,
-            event_type,
-            created_at,
-            body,
-        }
-    }
-}
-
-#[derive(Deserialize, Serialize, Debug, PartialEq, Clone)]
-struct EventValue {
-    aggregate_sequence: u64,
-    event_id: Uuid,
-    aggregate_id: Uuid,
-    event_type: String,
-    created_at: DateTime<Utc>,
-    body: JsonValue,
-}
-
-impl EventValue {
-    fn from_new_event(new_event: NewEvent, aggregate_id: Uuid, event_id: Uuid) -> Self {
+    fn from_new_event(
+        new_event: NewEvent,
+        aggregate_id: Uuid,
+        event_id: Uuid,
+        sequence: u64,
+    ) -> Self {
         let NewEvent {
             aggregate_sequence,
             event_type,
@@ -77,6 +47,7 @@ impl EventValue {
         } = new_event;
 
         Self {
+            sequence,
             aggregate_sequence,
             event_id,
             aggregate_id,
@@ -90,31 +61,18 @@ impl EventValue {
 #[derive(Clone)]
 pub struct EventStore {
     storage: Storage,
+    sequence: Arc<AtomicU64>,
     uuid_generator: Arc<dyn UuidGenerator>,
 }
 
-#[derive(Error, Debug, PartialEq)]
+#[derive(Error, Debug)]
 pub enum SinkError {
     #[error("Stale aggregate")]
     StaleAggregate,
     #[error("Event ID conflict")]
     EventIdConflict,
-}
-
-#[derive(FromBytes, AsBytes, Unaligned)]
-#[repr(C)]
-struct Sequence(U64<BigEndian>);
-
-impl Sequence {
-    fn new(value: u64) -> Self {
-        Self(U64::new(value))
-    }
-
-    fn from_slice(bytes: &mut [u8]) -> u64 {
-        let layout: LayoutVerified<&mut [u8], Self> =
-            LayoutVerified::new_unaligned(&mut *bytes).expect("bytes do not fit schema");
-        layout.into_ref().0.get()
-    }
+    #[error("Storage error")]
+    StorageError(#[from] io::Error),
 }
 
 trait UuidGenerator: Sync + Send {
@@ -131,34 +89,50 @@ impl UuidGenerator for UuidGeneratorV4 {
 
 impl EventStore {
     pub fn new(path: PathBuf) -> io::Result<Self> {
-        let mut storage = Storage::create_db(path).unwrap();
-
+        let storage = Storage::create_db(path).unwrap();
         Ok(Self::new_with_storage(storage))
     }
 
     pub fn new_with_storage(storage: Storage) -> Self {
         Self {
             storage,
+            sequence: Arc::new(AtomicU64::new(1)),
             uuid_generator: Arc::new(UuidGeneratorV4),
         }
     }
 
     pub fn sink(&self, new_events: Vec<NewEvent>, aggregate_id: Uuid) -> Result<(), SinkError> {
-        let event_id = self.uuid_generator.generate();
-
         let mut events = Vec::new();
+
         for new_event in new_events {
-            let event = EventValue::from_new_event(new_event, aggregate_id, event_id);
+            let event_id = self.uuid_generator.generate();
+
+            self.storage
+                .reserve_key_in_index("event_id_unique_index", event_id.to_string())
+                .map_err(|_| SinkError::EventIdConflict)?;
+
+            let sequence = self.sequence.fetch_add(1, Ordering::SeqCst);
+
+            // Check aggregate_id + aggregate_sequence
+            let key = format!("{}{}", aggregate_id, new_event.aggregate_sequence);
+            self.storage
+                .reserve_key_in_index("aggregate_id_aggregate_sequence_unique_index", key)
+                .map_err(|_| SinkError::StaleAggregate)?;
+
+            let event = Event::from_new_event(new_event, aggregate_id, event_id, sequence);
             let blob = serde_json::to_vec(&event).unwrap();
+
             events.push(blob);
         }
 
-        self.storage.append(events);
+        self.storage
+            .append(events)
+            .map_err(SinkError::StorageError)?;
 
         Ok(())
     }
 
-    pub fn for_aggregate(&self, aggregate_id: Uuid) -> io::Result<Vec<Event>> {
+    pub fn for_aggregate(&self, _aggregate_id: Uuid) -> io::Result<Vec<Event>> {
         // TODO: Actually find events for the aggregate
         self.after(0, None)
     }
@@ -169,24 +143,13 @@ impl EventStore {
         let _sequence = sequence + 1;
         let _limit = limit.unwrap_or(DEFAULT_LIMIT);
 
-        // itertools::process_results(aggregates.scan_prefix(&aggregate_id.as_bytes()), |iter| {
-
         Ok(self
             .storage
             .events()?
             .iter()
-            .map(|blob| {
-                let event_data: EventValue = serde_json::from_slice(&blob).expect("decode error");
-                let sequence = 1; // TODO
-                Event::from_event_data(event_data, sequence)
-            })
+            .map(|blob| serde_json::from_slice(&blob).expect("decode error"))
             .collect())
     }
-}
-
-fn to_u64(input: &[u8]) -> u64 {
-    let input: [u8; 8] = (*input).try_into().unwrap();
-    u64::from_be_bytes(input)
 }
 
 #[cfg(test)]
@@ -234,61 +197,73 @@ mod tests {
         }
     }
 
-    // #[test]
-    // fn sink_stale_aggregate() {
-    //     use sled::transaction::TransactionError;
-    //
-    //     let event_store = EventStore::new().unwrap();
-    //
-    //     let aggregate_id = Uuid::new_v4();
-    //     let event = NewEvent {
-    //         aggregate_sequence: 1,
-    //         event_type: String::new(),
-    //         body: json!({}),
-    //     };
-    //
-    //     let sink_1_result = event_store.sink(vec![event.clone()], aggregate_id.clone());
-    //     assert!(sink_1_result.is_ok());
-    //
-    //     // The second sink will fail because the aggregate_sequence has already been used by this
-    //     // aggregate.
-    //     let sink_2_result = event_store.sink(vec![event], aggregate_id.clone());
-    //     assert_eq!(
-    //         sink_2_result.unwrap_err(),
-    //         TransactionError::Abort(SinkError::StaleAggregate)
-    //     );
-    // }
+    #[test]
+    fn sink_stale_aggregate() {
+        let temp = tempdir();
+        let mut path = PathBuf::from(temp.path());
+        path.push("store.db");
 
-    // #[test]
-    // fn sink_duplicate_event_id() {
-    //     use sled::transaction::TransactionError;
-    //
-    //     let mut event_store = EventStore::new().unwrap();
-    //
-    //     // Override the event UUID generator so we can make it generate a duplicate
-    //     struct FakeUuidGenerator;
-    //     impl UuidGenerator for FakeUuidGenerator {
-    //         fn generate(&self) -> Uuid {
-    //             Uuid::parse_str("0436430c-2b02-624c-2032-570501212b57").unwrap()
-    //         }
-    //     }
-    //     event_store.uuid_generator = Arc::new(FakeUuidGenerator);
-    //
-    //     let event = NewEvent {
-    //         aggregate_sequence: 1,
-    //         event_type: String::new(),
-    //         body: json!({}),
-    //     };
-    //
-    //     let sink_1_result = event_store.sink(vec![event.clone()], Uuid::new_v4());
-    //     assert!(sink_1_result.is_ok());
-    //
-    //     let sink_2_result = event_store.sink(vec![event], Uuid::new_v4());
-    //     assert_eq!(
-    //         sink_2_result.unwrap_err(),
-    //         TransactionError::Abort(SinkError::EventIdConflict)
-    //     );
-    // }
+        let storage = Storage::create_db(path).unwrap();
+
+        let event_store = EventStore::new_with_storage(storage);
+
+        let aggregate_id = Uuid::new_v4();
+        let event = NewEvent {
+            aggregate_sequence: 1,
+            event_type: String::new(),
+            body: json!({}),
+        };
+
+        let sink_1_result = event_store.sink(vec![event.clone()], aggregate_id.clone());
+        assert!(sink_1_result.is_ok());
+
+        // The second sink will fail because the aggregate_sequence has already been used by this
+        // aggregate.
+        let sink_2_result = event_store.sink(vec![event], aggregate_id.clone());
+        match sink_2_result {
+            Err(SinkError::StaleAggregate) => {}
+            _ => panic!("wrong error"),
+        }
+    }
+
+    #[test]
+    fn sink_duplicate_event_id() {
+        let (mut event_store, _tempdir_guard) = new_event_store();
+
+        // Override the event UUID generator so we can make it generate a duplicate
+        struct FakeUuidGenerator;
+        impl UuidGenerator for FakeUuidGenerator {
+            fn generate(&self) -> Uuid {
+                Uuid::parse_str("0436430c-2b02-624c-2032-570501212b57").unwrap()
+            }
+        }
+        event_store.uuid_generator = Arc::new(FakeUuidGenerator);
+
+        let event = NewEvent {
+            aggregate_sequence: 1,
+            event_type: String::new(),
+            body: json!({}),
+        };
+
+        let sink_1_result = event_store.sink(vec![event.clone()], Uuid::new_v4());
+        assert!(sink_1_result.is_ok());
+
+        let sink_2_result = event_store.sink(vec![event], Uuid::new_v4());
+        match sink_2_result {
+            Err(SinkError::EventIdConflict) => {}
+            _ => panic!("wrong error"),
+        }
+    }
+
+    fn new_event_store() -> (EventStore, tempfile::TempDir) {
+        let temp = tempdir();
+        let mut path = PathBuf::from(temp.path());
+        path.push("store.db");
+
+        let storage = Storage::create_db(path).unwrap();
+
+        (EventStore::new_with_storage(storage), temp)
+    }
 
     fn tempdir() -> tempfile::TempDir {
         tempfile::Builder::new()

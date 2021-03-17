@@ -4,6 +4,7 @@ use uuid::Uuid;
 use warp::http::StatusCode;
 use warp::Filter;
 
+use std::convert::TryFrom;
 use std::path::PathBuf;
 
 use esdb::{EventStore, NewEvent};
@@ -74,11 +75,9 @@ async fn main() {
         .with_span_events(FmtSpan::CLOSE)
         .init();
 
-    let path: PathBuf = if let Ok(path) = std::env::var("DATABASE_PATH") {
-        todo!()
-    } else {
-        todo!()
-    };
+    let path =
+        PathBuf::try_from(std::env::var("DATABASE_PATH").expect("missing env DATABASE_PATH"))
+            .expect("invalid path");
 
     let event_store = EventStore::new(path).expect("TODO");
 
