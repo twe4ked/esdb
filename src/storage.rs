@@ -140,7 +140,7 @@ impl Storage {
         // If we don't have a current data page, add a new one
         if !current_data_page.is_some() {
             let index = self.next_page_index.fetch_add(PAGE_SIZE, Ordering::SeqCst);
-            *current_data_page = Some(Page::add(&mut file, index, PAGE_SIZE, b'D', 0)?);
+            *current_data_page = Some(Page::add_data(&mut file, index, PAGE_SIZE)?);
         }
 
         // TODO: Check aggregate_id_aggregate_sequence_unique_index
@@ -174,11 +174,10 @@ impl Storage {
 
                 let overflow_index = self.next_page_index.fetch_add(PAGE_SIZE, Ordering::SeqCst);
                 page.write(&mut file, &[data, &overflow_index.to_be_bytes()].concat())?;
-                *page = Page::add(
+                *page = Page::add_data_with_offset(
                     &mut file,
                     overflow_index,
                     PAGE_SIZE,
-                    b'D',
                     remaining.len() as u64,
                 )?;
             }
@@ -263,6 +262,9 @@ impl Storage {
                     let page_header_len = PAGE_HEADER_LEN as usize;
 
                     let mut i = page_header_len; // TODO: This skips the header, make this nicer
+
+                    // We might have overflow data at the beginning of the page, if so we want to
+                    // skip over it
                     i += offset as usize;
 
                     loop {
@@ -336,7 +338,7 @@ impl Storage {
         let mut current_index_page = self.current_index_page.lock().expect("poisoned");
         if !current_index_page.is_some() {
             let index = self.next_page_index.fetch_add(PAGE_SIZE, Ordering::SeqCst);
-            *current_index_page = Some(Page::add(&mut file, index, PAGE_SIZE, b'I', 0)?);
+            *current_index_page = Some(Page::add_index(&mut file, index, PAGE_SIZE)?);
         }
 
         // TODO: Build next part of index into buffer

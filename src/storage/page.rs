@@ -98,7 +98,24 @@ impl Page {
         self.len - used
     }
 
-    pub fn add(file: &mut File, index: u64, len: u64, ident: u8, offset: u64) -> io::Result<Self> {
+    pub fn add_data(file: &mut File, index: u64, len: u64) -> io::Result<Self> {
+        Self::add_data_with_offset(file, index, len, 0)
+    }
+
+    pub fn add_data_with_offset(
+        file: &mut File,
+        index: u64,
+        len: u64,
+        offset: u64,
+    ) -> io::Result<Self> {
+        Self::add(file, index, len, b'D', offset)
+    }
+
+    pub fn add_index(file: &mut File, index: u64, len: u64) -> io::Result<Self> {
+        Self::add(file, index, len, b'I', 0)
+    }
+
+    fn add(file: &mut File, index: u64, len: u64, ident: u8, offset: u64) -> io::Result<Self> {
         file.seek(io::SeekFrom::Start(index))?;
 
         file.write_all(&[ident])?; // 1
