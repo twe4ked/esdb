@@ -284,33 +284,46 @@ impl Storage {
                         let event: NewEvent;
 
                         // Check for overflow
-                        // TODO: event_len >= (page_len - i)
-                        if i + event_len >= page_len {
+                        if event_len < (page_len - i) {
+                            event = serde_json::from_slice(&data[i..(i + event_len)])
+                                .expect("unable to deserialize");
+                        } else {
                             // Read the rest of the page, minus the last 8 bytes, which contain
                             // the overflow pointer
                             let mut event_data = data[i..page_len - 8].to_vec();
-                            let remaining_to_read = event_len - event_data.len();
+                            let mut remaining_to_read = event_len - event_data.len();
 
                             // Read the index of the overflow page
-                            let overflow_page_index = u64_from_be_bytes(&data[page_len - 8..]);
-                            let (overflow_data, _offset) =
-                                Page::read(&mut file, overflow_page_index)?
-                                    .expect("missing overflow page")
-                                    .unwrap_data();
+                            let mut overflow_page_index = u64_from_be_bytes(&data[page_len - 8..]);
 
-                            let mut overflow_event_data =
+                            while remaining_to_read > 0 {
+                                let (overflow_data, _offset) =
+                                    Page::read(&mut file, overflow_page_index)?
+                                        .expect("missing overflow page")
+                                        .unwrap_data();
+
                                 // Skip the header, then read the remaining data
-                                overflow_data[page_header_len..remaining_to_read + page_header_len].to_vec();
+                                let mut overflow_event_data =
+                                    if remaining_to_read > overflow_data.len() {
+                                        // todo!("multi page overflow!");
+                                        overflow_page_index =
+                                            u64_from_be_bytes(&overflow_data[page_len - 8..]);
+                                        overflow_data[page_header_len..page_len - 8].to_vec()
+                                    } else {
+                                        overflow_data
+                                            [page_header_len..remaining_to_read + page_header_len]
+                                            .to_vec()
+                                    };
 
-                            event_data.append(&mut overflow_event_data);
+                                event_data.append(&mut overflow_event_data);
 
-                            // dbg!((&event_data[0..256]).hex_dump());
+                                remaining_to_read = event_len - event_data.len();
+                            }
+
+                            // dbg!((&event_data[..]).hex_dump());
 
                             event =
                                 serde_json::from_slice(&event_data).expect("unable to deserialize");
-                        } else {
-                            event = serde_json::from_slice(&data[i..(i + event_len)])
-                                .expect("unable to deserialize");
                         }
 
                         i += event_len;
@@ -535,12 +548,12 @@ mod tests {
                 PageRef::Data {
                     index: PAGE_SIZE * 2,
                     length: PAGE_SIZE,
-                    offset: 0, // XXX: This is an overflow page
+                    offset: 4184,
                 },
                 PageRef::Data {
                     index: PAGE_SIZE * 3,
                     length: PAGE_SIZE,
-                    offset: 0, // XXX: This is an overflow page
+                    offset: 113,
                 },
                 PageRef::Index {
                     index: PAGE_SIZE * 4,
