@@ -10,15 +10,16 @@ use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
-use pretty_hex::*;
 use uuid::Uuid;
+
+#[allow(unused_imports)]
+use pretty_hex::*;
 
 mod page;
 
 use page::*;
 
 const FILE_HEADER: &str = "esdb"; // TODO: Use a meta page instead of this header
-const PAGE_HEADER_LEN: u64 = 9;
 
 // NOTES
 // =====
@@ -139,7 +140,7 @@ impl Storage {
         // If we don't have a current data page, add a new one
         if !current_data_page.is_some() {
             let index = self.next_page_index.fetch_add(PAGE_SIZE, Ordering::SeqCst);
-            *current_data_page = Some(Page::add(&mut file, index, PAGE_SIZE, b'D')?);
+            *current_data_page = Some(Page::add(&mut file, index, PAGE_SIZE, b'D', 0)?);
         }
 
         // TODO: Check aggregate_id_aggregate_sequence_unique_index
@@ -158,11 +159,7 @@ impl Storage {
         let mut remaining = &buffer[..];
 
         if let Some(page) = current_data_page.as_mut() {
-            // let mut page = page;
-            let mut overflowed = false;
-
             while remaining.len() as u64 > page.free() {
-                overflowed = true;
                 // dbg!(remaining.len());
                 // dbg!(page.free());
 
@@ -177,13 +174,16 @@ impl Storage {
 
                 let overflow_index = self.next_page_index.fetch_add(PAGE_SIZE, Ordering::SeqCst);
                 page.write(&mut file, &[data, &overflow_index.to_be_bytes()].concat())?;
-                *page = Page::add(&mut file, overflow_index, PAGE_SIZE, b'O')?;
+                *page = Page::add(
+                    &mut file,
+                    overflow_index,
+                    PAGE_SIZE,
+                    b'D',
+                    remaining.len() as u64,
+                )?;
             }
 
             page.write(&mut file, &remaining)?;
-            if overflowed {
-                *current_data_page = None;
-            }
         }
 
         file.sync_data()?;
@@ -255,14 +255,16 @@ impl Storage {
 
         while let Some(page_data) = Page::read(&mut file, pos)? {
             match page_data {
-                PageData::Data(data) => {
-                    debug_assert_eq!(data.len(), PAGE_SIZE as usize);
+                PageData::Data(data, offset) => {
+                    // debug_assert_eq!(data.len(), PAGE_SIZE as usize);
 
                     // Read events from the data page
                     let page_len = data.len();
                     let page_header_len = PAGE_HEADER_LEN as usize;
 
                     let mut i = page_header_len; // TODO: This skips the header, make this nicer
+                    i += offset as usize;
+
                     loop {
                         if i >= page_len {
                             break;
@@ -278,21 +280,21 @@ impl Storage {
                         }
 
                         let event: NewEvent;
-                        let event_data = Vec::new();
 
                         // Check for overflow
+                        // TODO: event_len >= (page_len - i)
                         if i + event_len >= page_len {
                             // Read the rest of the page, minus the last 8 bytes, which contain
                             // the overflow pointer
-                            event_data = data[i..page_len - 8].to_vec();
+                            let mut event_data = data[i..page_len - 8].to_vec();
                             let remaining_to_read = event_len - event_data.len();
 
                             // Read the index of the overflow page
                             let overflow_page_index = u64_from_be_bytes(&data[page_len - 8..]);
-                            // Read the overflow page
-                            let overflow_data = Page::read(&mut file, overflow_page_index)?
-                                .expect("missing overflow page")
-                                .unwrap_overflow();
+                            let (overflow_data, _offset) =
+                                Page::read(&mut file, overflow_page_index)?
+                                    .expect("missing overflow page")
+                                    .unwrap_data();
 
                             let mut overflow_event_data =
                                 // Skip the header, then read the remaining data
@@ -300,7 +302,7 @@ impl Storage {
 
                             event_data.append(&mut overflow_event_data);
 
-                            dbg!((&event_data[0..256]).hex_dump());
+                            // dbg!((&event_data[0..256]).hex_dump());
 
                             event =
                                 serde_json::from_slice(&event_data).expect("unable to deserialize");
@@ -316,8 +318,7 @@ impl Storage {
 
                     pos += page_len as u64;
                 }
-                PageData::Index(data) => pos += data.len() as u64,
-                PageData::Overflow(data) => pos += data.len() as u64,
+                PageData::Index(data, _offset) => pos += data.len() as u64,
             }
         }
 
@@ -335,7 +336,7 @@ impl Storage {
         let mut current_index_page = self.current_index_page.lock().expect("poisoned");
         if !current_index_page.is_some() {
             let index = self.next_page_index.fetch_add(PAGE_SIZE, Ordering::SeqCst);
-            *current_index_page = Some(Page::add(&mut file, index, PAGE_SIZE, b'I')?);
+            *current_index_page = Some(Page::add(&mut file, index, PAGE_SIZE, b'I', 0)?);
         }
 
         // TODO: Build next part of index into buffer
@@ -398,11 +399,13 @@ mod tests {
             vec![
                 PageRef::Data {
                     index: PAGE_SIZE,
-                    length: PAGE_SIZE
+                    length: PAGE_SIZE,
+                    offset: 0,
                 },
                 PageRef::Index {
                     index: PAGE_SIZE * 2,
-                    length: PAGE_SIZE
+                    length: PAGE_SIZE,
+                    offset: 0,
                 },
             ]
         );
@@ -439,15 +442,18 @@ mod tests {
             vec![
                 PageRef::Data {
                     index: PAGE_SIZE,
-                    length: PAGE_SIZE
+                    length: PAGE_SIZE,
+                    offset: 0,
                 },
-                PageRef::Overflow {
+                PageRef::Data {
                     index: PAGE_SIZE * 2,
-                    length: PAGE_SIZE
+                    length: PAGE_SIZE,
+                    offset: 88, // XXX: This is an overflow page
                 },
                 PageRef::Index {
                     index: PAGE_SIZE * 3,
-                    length: PAGE_SIZE
+                    length: PAGE_SIZE,
+                    offset: 0,
                 },
             ]
         );
@@ -466,23 +472,23 @@ mod tests {
             vec![
                 PageRef::Data {
                     index: PAGE_SIZE,
-                    length: PAGE_SIZE
+                    length: PAGE_SIZE,
+                    offset: 0,
                 },
-                PageRef::Overflow {
+                PageRef::Data {
                     index: PAGE_SIZE * 2,
-                    length: PAGE_SIZE
+                    length: PAGE_SIZE,
+                    offset: 88,
                 },
                 PageRef::Index {
                     index: PAGE_SIZE * 3,
-                    length: PAGE_SIZE
+                    length: PAGE_SIZE,
+                    offset: 0,
                 },
                 PageRef::Data {
                     index: PAGE_SIZE * 4,
-                    length: PAGE_SIZE
-                },
-                PageRef::Overflow {
-                    index: PAGE_SIZE * 5,
-                    length: PAGE_SIZE
+                    length: PAGE_SIZE,
+                    offset: 176,
                 },
             ]
         );
@@ -521,19 +527,23 @@ mod tests {
             vec![
                 PageRef::Data {
                     index: PAGE_SIZE,
-                    length: PAGE_SIZE
+                    length: PAGE_SIZE,
+                    offset: 0,
                 },
-                PageRef::Overflow {
+                PageRef::Data {
                     index: PAGE_SIZE * 2,
-                    length: PAGE_SIZE
+                    length: PAGE_SIZE,
+                    offset: 0, // XXX: This is an overflow page
                 },
-                PageRef::Overflow {
+                PageRef::Data {
                     index: PAGE_SIZE * 3,
-                    length: PAGE_SIZE
+                    length: PAGE_SIZE,
+                    offset: 0, // XXX: This is an overflow page
                 },
                 PageRef::Index {
                     index: PAGE_SIZE * 4,
-                    length: PAGE_SIZE
+                    length: PAGE_SIZE,
+                    offset: 0,
                 },
             ]
         );

@@ -4,8 +4,10 @@ use std::fs::File;
 use std::io::prelude::*;
 use std::io::{self, BufReader, ErrorKind};
 
+use pretty_hex::*;
+
 pub const PAGE_SIZE: u64 = 4096;
-const PAGE_HEADER_LEN: u64 = 9;
+pub const PAGE_HEADER_LEN: u64 = 17;
 
 /// |======================================|
 /// | Page Header                          |
@@ -14,15 +16,20 @@ const PAGE_HEADER_LEN: u64 = 9;
 /// |------------|---------------|---------|
 /// | I len (BE) | Index page    | 73 0x49 |
 /// |------------|---------------|---------|
-/// | O len (BE) | Overflow page | 79 0x4f |
-/// |--------------------------------------|
 ///
 /// https://en.wikipedia.org/wiki/Type-length-value
 #[derive(Debug, PartialEq)]
 pub enum PageRef {
-    Data { index: u64, length: u64 },
-    Index { index: u64, length: u64 },
-    Overflow { index: u64, length: u64 },
+    Data {
+        index: u64,
+        length: u64,
+        offset: u64,
+    },
+    Index {
+        index: u64,
+        length: u64,
+        offset: u64,
+    },
 }
 
 impl PageRef {
@@ -30,7 +37,6 @@ impl PageRef {
         match self {
             PageRef::Data { length, .. } => *length,
             PageRef::Index { length, .. } => *length,
-            PageRef::Overflow { length, .. } => *length,
         }
     }
 
@@ -38,28 +44,38 @@ impl PageRef {
         let len = PAGE_HEADER_LEN as usize;
         debug_assert_eq!(input.len(), len);
 
-        let length = u64_from_be_bytes(&input[1..len]);
+        let length = u64_from_be_bytes(&input[1..9]);
+        let offset = u64_from_be_bytes(&input[9..17]);
 
         match input[0] {
-            b'D' => PageRef::Data { index, length },     // 68 0x44
-            b'I' => PageRef::Index { index, length },    // 73 0x49
-            b'O' => PageRef::Overflow { index, length }, // 79 0x4f
-            _ => panic!("invalid page header"),
+            b'D' => PageRef::Data {
+                index,
+                length,
+                offset,
+            }, // 68 0x44
+            b'I' => PageRef::Index {
+                index,
+                length,
+                offset,
+            }, // 73 0x49
+            _ => {
+                dbg!((&input).hex_dump());
+                panic!("invalid page header")
+            }
         }
     }
 }
 
 #[derive(Debug)]
 pub enum PageData {
-    Data(Vec<u8>),
-    Index(Vec<u8>),
-    Overflow(Vec<u8>),
+    Data(Vec<u8>, u64),
+    Index(Vec<u8>, u64),
 }
 
 impl PageData {
-    pub fn unwrap_overflow(self) -> Vec<u8> {
+    pub fn unwrap_data(self) -> (Vec<u8>, u64) {
         match self {
-            PageData::Overflow(data) => data,
+            PageData::Data(data, offset) => (data, offset),
             _ => panic!("not an overflow page: {:?}", self),
         }
     }
@@ -82,13 +98,14 @@ impl Page {
         self.len - used
     }
 
-    pub fn add(file: &mut File, index: u64, len: u64, ident: u8) -> io::Result<Self> {
+    pub fn add(file: &mut File, index: u64, len: u64, ident: u8, offset: u64) -> io::Result<Self> {
         file.seek(io::SeekFrom::Start(index))?;
 
         file.write_all(&[ident])?; // 1
         file.write_all(&len.to_be_bytes())?; // 8
+        file.write_all(&offset.to_be_bytes())?; // 8
 
-        debug_assert_eq!(1 + 8, PAGE_HEADER_LEN);
+        debug_assert_eq!(1 + 8 + 8, PAGE_HEADER_LEN);
 
         Ok(Self {
             index,
@@ -116,9 +133,8 @@ impl Page {
         file.take(page_ref.len()).read_to_end(&mut buf)?;
 
         let page_data = match page_ref {
-            PageRef::Data { .. } => PageData::Data(buf),
-            PageRef::Index { .. } => PageData::Index(buf),
-            PageRef::Overflow { .. } => PageData::Overflow(buf),
+            PageRef::Data { offset, .. } => PageData::Data(buf, offset),
+            PageRef::Index { offset, .. } => PageData::Index(buf, offset),
         };
 
         Ok(Some(page_data))
@@ -147,23 +163,27 @@ mod tests {
     fn test_parse_page_header() {
         let mut input = b"I".to_vec();
         input.append(&mut 123_u64.to_be_bytes().to_vec());
+        input.append(&mut 456_u64.to_be_bytes().to_vec());
 
         assert_eq!(
             PageRef::parse_from_header(&input, 42),
             PageRef::Index {
                 index: 42,
-                length: 123
+                length: 123,
+                offset: 456,
             }
         );
 
         let mut input = b"D".to_vec();
         input.append(&mut 123_u64.to_be_bytes().to_vec());
+        input.append(&mut 456_u64.to_be_bytes().to_vec());
 
         assert_eq!(
             PageRef::parse_from_header(&input, 42),
             PageRef::Data {
                 index: 42,
-                length: 123
+                length: 123,
+                offset: 456,
             }
         );
     }
