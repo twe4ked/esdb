@@ -129,7 +129,7 @@ impl Storage {
     }
 
     #[allow(dead_code)]
-    pub fn append(&mut self, new_events: Vec<Vec<u8>>) -> io::Result<()> {
+    pub fn append(&self, new_events: Vec<Vec<u8>>) -> io::Result<()> {
         let mut file = self.file()?;
 
         let mut current_data_page = self.current_data_page.lock().expect("poisoned");
@@ -232,7 +232,7 @@ impl Storage {
     }
 
     #[allow(dead_code)]
-    pub fn events(&mut self) -> io::Result<Vec<Vec<u8>>> {
+    pub fn events(&self) -> io::Result<Vec<Vec<u8>>> {
         let mut file = BufReader::new(self.file()?);
 
         // Start after the meta page

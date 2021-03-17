@@ -1,9 +1,10 @@
 use serde::{Deserialize, Serialize};
-use sled::Config;
 use tracing_subscriber::fmt::format::FmtSpan;
 use uuid::Uuid;
 use warp::http::StatusCode;
 use warp::Filter;
+
+use std::path::PathBuf;
 
 use esdb::{EventStore, NewEvent};
 
@@ -73,13 +74,13 @@ async fn main() {
         .with_span_events(FmtSpan::CLOSE)
         .init();
 
-    let db = if let Ok(path) = std::env::var("DATABASE_PATH") {
-        Config::default().path(path).open()
+    let path: PathBuf = if let Ok(path) = std::env::var("DATABASE_PATH") {
+        todo!()
     } else {
-        Config::default().temporary(true).open()
-    }
-    .unwrap();
-    let event_store = EventStore::new_with_db(db);
+        todo!()
+    };
+
+    let event_store = EventStore::new(path).expect("TODO");
 
     warp::serve(routes(event_store).with(warp::trace::request()))
         .run(([127, 0, 0, 1], 3030))
