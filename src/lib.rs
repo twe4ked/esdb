@@ -11,7 +11,7 @@ use std::sync::Arc;
 
 mod storage;
 
-use storage::Storage;
+use storage::{Storage, UniqueIndexUpdate};
 
 const DEFAULT_LIMIT: usize = 1000;
 
@@ -60,7 +60,7 @@ impl Event {
 
 #[derive(Clone)]
 pub struct EventStore {
-    storage: Storage,
+    storage: Storage<Indexer>,
     sequence: Arc<AtomicU64>,
     uuid_generator: Arc<dyn UuidGenerator>,
 }
@@ -89,13 +89,24 @@ impl UuidGenerator for UuidGeneratorV4 {
     }
 }
 
+#[derive(Clone)]
+pub struct Indexer;
+
+impl storage::Indexer for Indexer {
+    fn run(&self, unindexed_blobs: Vec<Vec<u8>>) -> Result<Vec<UniqueIndexUpdate>, ()> {
+        todo!();
+    }
+}
+
 impl EventStore {
     pub fn new(path: PathBuf) -> io::Result<Self> {
-        let storage = Storage::create_db(path).unwrap();
+        let mut storage = Storage::create_db(path).unwrap();
+        storage.set_indexer(Indexer {});
+
         Ok(Self::new_with_storage(storage))
     }
 
-    pub fn new_with_storage(storage: Storage) -> Self {
+    pub fn new_with_storage(storage: Storage<Indexer>) -> Self {
         Self {
             storage,
             sequence: Arc::new(AtomicU64::new(1)),
