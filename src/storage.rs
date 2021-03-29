@@ -248,6 +248,8 @@ where
             .lock()
             .expect("poisoned");
 
+        dbg!(&key);
+
         // If the set did not have this value present, true is returned
         if index.insert(key) {
             Ok(())
@@ -373,9 +375,19 @@ where
             let unindexed_blobs = self.events()?;
 
             let indexer = indexer.lock().expect("poisoned");
-            let unique_index_updates = indexer.run(unindexed_blobs)?;
+            let unique_index_updates = indexer
+                .run(unindexed_blobs)
+                .map_err(|_| io::Error::new(ErrorKind::Other, "index update error run"))?;
 
-            // TODO: Update the unique indexes
+            for unique_index_update in unique_index_updates {
+                // TODO: Use this: unique_index_update.index_name instead of hardcoding the index
+                // name below.
+
+                // TODO: Update the unique indexes
+
+                self.reserve_key_in_index(&"event_id_unique_index", unique_index_update.unique_key)
+                    .map_err(|_| io::Error::new(ErrorKind::Other, "index update error"))?;
+            }
         }
 
         // TODO: Build next part of index into buffer
