@@ -38,12 +38,13 @@ const FILE_HEADER: &str = "esdb"; // TODO: Use a meta page instead of this heade
 // - https://fadden.com/tech/file-formats.html
 
 #[derive(Clone)]
-pub struct Storage {
+pub struct Storage<T: Indexer + Send + Sync + Clone> {
     path: PathBuf,
     next_page_index: Arc<AtomicU64>,
     current_data_page: Arc<Mutex<Option<Page>>>,
     current_index_page: Arc<Mutex<Option<Page>>>,
     aggregate_id_aggregate_sequence_unique_index: Arc<Mutex<BTreeSet<String>>>,
+    indexer: Option<Arc<Mutex<Box<T>>>>,
 }
 
 fn ensure_header(file: &mut File) -> io::Result<()> {
@@ -67,8 +68,10 @@ fn file(path: &PathBuf) -> io::Result<File> {
     OpenOptions::new().read(true).write(true).open(path)
 }
 
-impl Storage {
-    #[allow(dead_code)]
+impl<T: 'static> Storage<T>
+where
+    T: Indexer + Send + Sync + Clone,
+{
     pub fn create_db(path: PathBuf) -> io::Result<Self> {
         let mut file = match file(&path) {
             Ok(file) => file,
@@ -88,10 +91,11 @@ impl Storage {
             current_data_page: Arc::new(Mutex::new(None)),
             current_index_page: Arc::new(Mutex::new(None)),
             aggregate_id_aggregate_sequence_unique_index: Arc::new(Mutex::new(BTreeSet::new())),
+            indexer: None,
         };
 
         // TODO: We should do this in case we crashed before last time.
-        // db.update_indexes_on_disk()?;
+        // db.update_indexes()?;
 
         Ok(db)
     }
@@ -128,7 +132,6 @@ impl Storage {
         Ok(pages)
     }
 
-    #[allow(dead_code)]
     pub fn append(&self, new_events: Vec<Vec<u8>>) -> io::Result<()> {
         let mut file = self.file()?;
 
@@ -188,7 +191,7 @@ impl Storage {
         // TODO: Kick off background task to update the indexes + header on the disk.
         let c = self.clone();
         std::thread::spawn(move || {
-            let _ = c.update_indexes_on_disk();
+            let _ = c.update_indexes();
         });
 
         // Indexes we need:
@@ -253,7 +256,6 @@ impl Storage {
         }
     }
 
-    #[allow(dead_code)]
     pub fn events(&self) -> io::Result<Vec<Vec<u8>>> {
         let mut file = BufReader::new(self.file()?);
 
@@ -349,35 +351,51 @@ impl Storage {
     }
 
     // https://github.com/wspeirs/btree/blob/master/src/disk_btree.rs
-    fn update_indexes_on_disk(&self) -> io::Result<()> {
-        // NOTE: We don't need to do this on each write, we could batch them.
-
+    fn update_indexes(&self) -> io::Result<()> {
         let mut file = self.file()?;
 
         // Add a new page
-        // TODO: Check if the page is full.
         let mut current_index_page = self.current_index_page.lock().expect("poisoned");
         if !current_index_page.is_some() {
             let index = self.next_page_index.fetch_add(PAGE_SIZE, Ordering::SeqCst);
             *current_index_page = Some(Page::add_index(&mut file, index, PAGE_SIZE)?);
         }
 
+        // Find blobs that _may_ be unindexed
+        // Call self.indexer.run(unindexed_blobs); to get the UniqueIndexUpdate requests
+        // Update the indexes for real-real, if they're not already updated
+
         // TODO: Build next part of index into buffer
         let buffer = Vec::new();
         file.seek(io::SeekFrom::Start(current_index_page.unwrap().head))?;
         file.write_all(&buffer)?;
 
-        // TODO: Are both of these needed?
-        file.flush()?;
-        file.sync_all()?;
+        // NOTE: We don't need to do this on each write
+        file.sync_data()?;
 
         Ok(())
     }
 
     #[allow(dead_code)]
     fn flush(&self) -> io::Result<()> {
-        self.update_indexes_on_disk()
+        self.update_indexes()
     }
+}
+
+/// A request to update a unique index
+pub struct UniqueIndexUpdate {
+    index_name: String,
+    unique_key: String,
+}
+
+impl<T: Indexer + Send + Sync + Clone> Storage<T> {
+    pub fn set_indexer(&mut self, indexer: T) {
+        self.indexer = Some(Arc::new(Mutex::new(Box::new(indexer))));
+    }
+}
+
+pub trait Indexer {
+    fn run(&self, unindexed_blobs: Vec<Vec<u8>>) -> Result<Vec<UniqueIndexUpdate>, ()>;
 }
 
 fn u64_from_be_bytes(input: &[u8]) -> u64 {
@@ -399,11 +417,7 @@ mod tests {
 
     #[test]
     fn basic() {
-        let temp = tempdir();
-        let mut path = PathBuf::from(temp.path());
-        path.push("store.db");
-
-        let mut storage = Storage::create_db(path).unwrap();
+        let (mut storage, _tempdir_guard) = StorageCreator::new();
 
         storage.append(vec![b"foo".to_vec()]).unwrap();
         storage.append(vec![b"bar".to_vec()]).unwrap();
@@ -434,11 +448,7 @@ mod tests {
 
     #[test]
     fn test_overflow() {
-        let temp = tempdir();
-        let mut path = PathBuf::from(temp.path());
-        path.push("store.db");
-
-        let mut storage = Storage::create_db(path).unwrap();
+        let (mut storage, _tempdir_guard) = StorageCreator::new();
 
         // Page size overflows because the header takes up room
         let overflow_len = PAGE_SIZE as usize;
@@ -505,11 +515,7 @@ mod tests {
 
     #[test]
     fn test_overflow_multiple_pages() {
-        let temp = tempdir();
-        let mut path = PathBuf::from(temp.path());
-        path.push("store.db");
-
-        let mut storage = Storage::create_db(path).unwrap();
+        let (mut storage, _tempdir_guard) = StorageCreator::new();
 
         // Page size overflows because the header takes up room
         let overflow_len = PAGE_SIZE as usize * 2;
@@ -545,11 +551,68 @@ mod tests {
         );
     }
 
+    // #[test]
+    // fn test_update_indexes() {
+    //     let (mut storage, _tempdir_guard) = StorageCreator::new::<MyTestIndexer>();
+    //
+    //     storage.append(vec![b"foo".to_vec()]).unwrap();
+    //     storage.append(vec![b"bar".to_vec()]).unwrap();
+    //
+    //     storage.flush().unwrap();
+    //
+    //     assert_eq!(
+    //         storage.pages().unwrap(),
+    //         vec![
+    //             PageRef::Data {
+    //                 index: PAGE_SIZE,
+    //                 length: PAGE_SIZE,
+    //                 offset: 0,
+    //             },
+    //             PageRef::Index {
+    //                 index: PAGE_SIZE * 2,
+    //                 length: PAGE_SIZE,
+    //                 offset: 0,
+    //             },
+    //         ]
+    //     );
+    //
+    //     assert_eq!(
+    //         storage.events().unwrap(),
+    //         vec![b"foo".to_vec(), b"bar".to_vec()]
+    //     );
+    // }
+
+    struct StorageCreator<T = TestIndexer>
+    where
+        T: Indexer + Send + Sync + Clone;
+
+    impl<T> StorageCreator<T>
+    where
+        T: Indexer + Send + Sync + Clone,
+    {
+        fn new() -> (Storage<T>, tempfile::TempDir) {
+            let temp = tempdir();
+            let mut path = PathBuf::from(temp.path());
+            path.push("store.db");
+
+            (Storage::create_db(path).unwrap(), temp)
+        }
+    }
+
     fn tempdir() -> tempfile::TempDir {
         tempfile::Builder::new()
             .prefix("esdb.")
             .rand_bytes(8)
             .tempdir()
             .expect("unable to create tempdir")
+    }
+
+    #[derive(Clone)]
+    pub struct TestIndexer;
+
+    impl Indexer for TestIndexer {
+        fn run(&self, unindexed_blobs: Vec<Vec<u8>>) -> Result<Vec<UniqueIndexUpdate>, ()> {
+            Ok(Vec::new())
+        }
     }
 }
